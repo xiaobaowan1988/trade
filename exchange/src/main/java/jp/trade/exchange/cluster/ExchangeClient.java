@@ -1,8 +1,11 @@
 package jp.trade.exchange.cluster;
 
+import io.aeron.CommonContext;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.logbuffer.Header;
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import io.aeron.samples.cluster.ClusterConfig;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,13 +22,29 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
     private final List<byte[]> responses = new ArrayList<>();
     private final SleepingIdleStrategy idle = new SleepingIdleStrategy(1_000_000);
 
+    private final MediaDriver ownedDriver;
+
+    /** 连接单成员集群，复用该节点的 MediaDriver。 */
     public ExchangeClient(String aeronDir) {
+        this(aeronDir, 1, null);
+    }
+
+    /** 连接 memberCount 成员集群，客户端自带独立 MediaDriver，不依赖任何一个集群节点存活。 */
+    public static ExchangeClient connect(int memberCount) {
+        final MediaDriver d = MediaDriver.launch(new MediaDriver.Context()
+                .threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true)
+                .aeronDirectoryName(CommonContext.getAeronDirectoryName() + "-client-" + System.nanoTime()));
+        return new ExchangeClient(d.aeronDirectoryName(), memberCount, d);
+    }
+
+    private ExchangeClient(String aeronDir, int memberCount, MediaDriver ownedDriver) {
+        this.ownedDriver = ownedDriver;
         this.cluster = AeronCluster.connect(new AeronCluster.Context()
                 .aeronDirectoryName(aeronDir)
                 .egressListener(this)
                 .ingressChannel("aeron:udp?term-length=64k")
                 .ingressEndpoints(ClusterConfig.ingressEndpoints(
-                        List.of(ExchangeNode.HOST), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
+                        ExchangeNode.hostnames(memberCount), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
                 .egressChannel("aeron:udp?endpoint=localhost:0"));
     }
 
@@ -39,8 +58,10 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
     private void send(int type, int aux, long account, long f1, long f2, long f3) {
         final int len = encodeCommand(buf, 0, type, aux, account, f1, f2, f3);
         long r;
+        final long deadline = System.currentTimeMillis() + 30_000;
         while ((r = cluster.offer(buf, 0, len)) < 0) {
-            if (r == io.aeron.Publication.CLOSED || r == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+            // NOT_CONNECTED/ADMIN_ACTION 等在 leader 切换期间是暂时的：继续 pollEgress 以接收新 leader 通知后重试
+            if (r == io.aeron.Publication.MAX_POSITION_EXCEEDED || System.currentTimeMillis() > deadline) {
                 throw new IllegalStateException("offer failed: " + r);
             }
             cluster.pollEgress();
@@ -73,5 +94,10 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
     }
 
     @Override
-    public void close() { cluster.close(); }
+    public void close() {
+        cluster.close();
+        if (ownedDriver != null) {
+            ownedDriver.close();
+        }
+    }
 }

@@ -6,7 +6,9 @@ import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.samples.cluster.ClusterConfig;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import jp.trade.exchange.events.EventBridge;
 import jp.trade.exchange.events.EventSink;
 import org.agrona.CloseHelper;
@@ -17,14 +19,16 @@ public final class ExchangeNode implements AutoCloseable {
     public static final int PORT_BASE = 9000;
     public static final String HOST = "localhost";
 
+    private final int memberId;
     private final File baseDir;
     private final ClusteredMediaDriver driver;
     private final ClusteredServiceContainer container;
     private final EventBridge bridge;
     private final ExchangeService service;
 
-    private ExchangeNode(File baseDir, ClusteredMediaDriver driver, ClusteredServiceContainer container,
+    private ExchangeNode(int memberId, File baseDir, ClusteredMediaDriver driver, ClusteredServiceContainer container,
                          EventBridge bridge, ExchangeService service) {
+        this.memberId = memberId;
         this.baseDir = baseDir;
         this.driver = driver;
         this.container = container;
@@ -32,26 +36,53 @@ public final class ExchangeNode implements AutoCloseable {
         this.service = service;
     }
 
-    /** @param fresh true 则清空数据目录从零开始；false 则从已有日志/快照恢复 */
+    /** 单成员集群。 */
     public static ExchangeNode start(File baseDir, boolean fresh, EventSink sink) {
+        return start(0, 1, baseDir, fresh, sink);
+    }
+
+    /**
+     * @param memberId    本节点编号，0..memberCount-1
+     * @param memberCount Raft 组成员数（1/3/5）
+     * @param fresh       true 则清空数据目录从零开始；false 则从已有日志/快照恢复
+     */
+    public static ExchangeNode start(int memberId, int memberCount, File baseDir, boolean fresh, EventSink sink) {
         if (fresh) {
             IoUtil.delete(baseDir, true);
         }
         baseDir.mkdirs();
         final ExchangeService service = new ExchangeService();
-        final ClusterConfig config = ClusterConfig.create(0, List.of(HOST), PORT_BASE, service);
+        final ClusterConfig config = ClusterConfig.create(memberId, hostnames(memberCount), PORT_BASE, service);
         config.baseDir(baseDir);
         config.aeronDirectoryName(new File(baseDir, "aeron").getAbsolutePath()); // 放磁盘而非 /dev/shm，容器内更稳
         config.errorHandler(Throwable::printStackTrace);
         config.mediaDriverContext().threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true);
-        config.consensusModuleContext().ingressChannel("aeron:udp?term-length=64k");
+        config.consensusModuleContext()
+                .ingressChannel("aeron:udp?term-length=64k")
+                .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(200))
+                .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)); // 默认 10s，缩短以加快故障切换
         config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
 
         final ClusteredMediaDriver driver = ClusteredMediaDriver.launch(
                 config.mediaDriverContext(), config.archiveContext(), config.consensusModuleContext());
         final ClusteredServiceContainer container = ClusteredServiceContainer.launch(config.clusteredServiceContext());
         final EventBridge bridge = new EventBridge(config.mediaDriverContext().aeronDirectoryName(), sink);
-        return new ExchangeNode(baseDir, driver, container, bridge, service);
+        return new ExchangeNode(memberId, baseDir, driver, container, bridge, service);
+    }
+
+    public static List<String> hostnames(int memberCount) {
+        final List<String> l = new ArrayList<>();
+        for (int i = 0; i < memberCount; i++) {
+            l.add(HOST);
+        }
+        return l;
+    }
+
+    public int memberId() { return memberId; }
+
+    /** 本节点 Archive 控制端口（补数进程通过它读取 Raft 日志录制）。 */
+    public String archiveControlEndpoint() {
+        return HOST + ":" + ClusterConfig.calculatePort(memberId, PORT_BASE, ClusterConfig.ARCHIVE_CONTROL_PORT_OFFSET);
     }
 
     public String aeronDirectoryName() { return driver.mediaDriver().aeronDirectoryName(); }

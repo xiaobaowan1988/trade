@@ -40,6 +40,7 @@ public final class ExchangeService implements ClusteredService {
     private boolean leader;
     private long droppedEvents;
     private volatile boolean loadedFromSnapshot;
+    private volatile Cluster.Role role = Cluster.Role.FOLLOWER;
 
     private final jp.trade.exchange.core.EventHandler handler = this::onEngineEvent;
 
@@ -133,7 +134,7 @@ public final class ExchangeService implements ClusteredService {
     }
 
     @Override
-    public void onRoleChange(Cluster.Role newRole) {}
+    public void onRoleChange(Cluster.Role newRole) { role = newRole; }
 
     @Override
     public void onTerminate(Cluster cluster) {}
@@ -142,6 +143,8 @@ public final class ExchangeService implements ClusteredService {
     public String stateHash() { return engine.stateHash(); }
 
     public long droppedEvents() { return droppedEvents; }
+
+    public Cluster.Role role() { return role; }
 
     public boolean loadedFromSnapshot() { return loadedFromSnapshot; }
 }
