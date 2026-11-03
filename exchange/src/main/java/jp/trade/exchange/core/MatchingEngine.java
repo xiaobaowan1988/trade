@@ -243,6 +243,35 @@ public final class MatchingEngine {
 
     public Long bestAsk() { return asks.isEmpty() ? null : asks.firstKey(); }
 
+    // ---------- 稽核用的只读遍历（顺序确定） ----------
+
+    @FunctionalInterface
+    public interface AccountVisitor {
+        void visit(long account, long availableBase, long availableQuote, long frozenBase, long frozenQuote);
+    }
+
+    @FunctionalInterface
+    public interface OrderVisitor {
+        void visit(long orderId, long account, int side, long price, long remaining);
+    }
+
+    public void forEachAccount(AccountVisitor v) {
+        for (Map.Entry<Long, Account> e : accounts.entrySet()) {
+            final Account a = e.getValue();
+            v.visit(e.getKey(), a.available[ASSET_BASE], a.available[ASSET_QUOTE], a.frozen[ASSET_BASE], a.frozen[ASSET_QUOTE]);
+        }
+    }
+
+    public void forEachOpenOrder(OrderVisitor v) {
+        for (int side : new int[]{SIDE_BUY, SIDE_SELL}) {
+            for (ArrayDeque<Order> level : book(side).values()) {
+                for (Order o : level) {
+                    v.visit(o.id, o.account, o.side, o.price, o.remaining);
+                }
+            }
+        }
+    }
+
     // ---------- 快照 ----------
 
     /** 序列化完整状态。遍历顺序全部有序，因此同一状态产生的字节完全一致，可直接用作状态哈希的输入。 */

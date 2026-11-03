@@ -35,6 +35,19 @@
       <artifactId>slf4j-nop</artifactId>
       <version>2.0.16</version>
     </dependency>
+    <!-- 投影测试用真实 MariaDB（MySQL 兼容）进程；生产换成 MySQL 官方驱动即可，SQL 无需改动 -->
+    <dependency>
+      <groupId>ch.vorburger.mariaDB4j</groupId>
+      <artifactId>mariaDB4j</artifactId>
+      <version>3.3.1</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mariadb.jdbc</groupId>
+      <artifactId>mariadb-java-client</artifactId>
+      <version>3.5.1</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

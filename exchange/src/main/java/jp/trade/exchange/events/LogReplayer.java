@@ -52,12 +52,23 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
 
     /** 重放已提交日志，把序号在 [fromSeq, toSeq]（含）内的事件交给 out。返回重放到的最后一个事件序号。 */
     public long replay(long fromSeq, long toSeq, jp.trade.exchange.core.EventHandler out) {
+        return run(fromSeq, toSeq, out).lastSeq;
+    }
+
+    /** 重放整个已提交日志，返回日志头处的完整撮合状态（用于与投影对账）。 */
+    public MatchingEngine rebuildState() {
+        return run(Long.MAX_VALUE, Long.MAX_VALUE, (a, b, c, d, e, f, g, h, i, j) -> {}).engine;
+    }
+
+    private record Result(MatchingEngine engine, long lastSeq) {}
+
+    private Result run(long fromSeq, long toSeq, jp.trade.exchange.core.EventHandler out) {
         final RecordingLog.RecoveryPlan plan;
         try (RecordingLog log = new RecordingLog(clusterDir, false)) {
             plan = log.createRecoveryPlan(archive, 1, io.aeron.Aeron.NULL_VALUE);
         }
         if (plan.log() == null) {
-            return 0; // 还没有任何日志
+            return new Result(new MatchingEngine(), 0); // 还没有任何日志
         }
         final long recordingId = plan.log().recordingId();
         final long start = archive.getStartPosition(recordingId);
@@ -65,11 +76,11 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
             throw new UnsupportedOperationException("日志已被裁剪(start=" + start + ")，需要从快照种子化引擎");
         }
         final long end = committedEnd(plan, recordingId);
+        final MatchingEngine engine = new MatchingEngine();
         if (end <= start) {
-            return 0;
+            return new Result(engine, 0);
         }
 
-        final MatchingEngine engine = new MatchingEngine();
         final long[] last = {0};
         final boolean[] done = {false};
         final jp.trade.exchange.core.EventHandler filter = (type, aux, seq, ts, orderId, account, price, qty, co, ca) -> {
@@ -122,7 +133,7 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
             archive.stopAllReplays(recordingId);
             CloseHelper.quietClose(sub);
         }
-        return last[0];
+        return new Result(engine, last[0]);
     }
 
     /**

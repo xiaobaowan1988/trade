@@ -108,7 +108,7 @@ Raft Log / 快照 → S3 归档 → 离线确定性重放 ⇄ 对账 ⇄ MySQL �
 
 ## 8. 骨架实现状态与已知限制
 
-代码位于 `exchange/`（Maven，Java 21，Aeron 1.54.0，Kafka client 3.9.0）。`mvn test` 运行全部 15 个测试，`./run.sh` 运行演示。
+代码位于 `exchange/`（Maven，Java 21，Aeron 1.54.0，Kafka client 3.9.0）。`mvn test` 运行全部测试（含真实 MariaDB 进程，首次运行需下载其二进制），`./run.sh` 运行演示。
 
 **已实现并有测试覆盖**
 * Aeron Cluster（1 或 3 成员 Raft 组）：MediaDriver + Archive + ConsensusModule + 撮合 `ClusteredService`。
@@ -117,6 +117,7 @@ Raft Log / 快照 → S3 归档 → 离线确定性重放 ⇄ 对账 ⇄ MySQL �
 * 单节点集成测试：事件序号连续、重启后日志重放恢复、快照恢复（断言确实从快照启动）。
 * **3 节点故障切换**：leader 宕机后选主；客户端超时重试后继续服务；已提交的挂单不丢；三个副本状态哈希一致；旧 leader 重启后从自己的日志恢复并追平。
 * **补数**：`LogReplayer` 读取 Archive 中的 Raft 日志，确定性重放生成任意序号区间的事件；`GapFillingConsumer` 作为下游参考实现，保存 `lastSeq`、丢弃重复、遇缺口调用补数、周期性追平日志头。测试覆盖头部/中间/尾部缺口，以及“leader 提交后、发布前崩溃”的真实切换场景，补回的事件与 leader 当时产生的逐字节一致。
+* **MySQL 投影（`projection/`）**：`JdbcProjector` 在同一事务里写业务表与 `last_seq`，`SELECT ... FOR UPDATE` 锁 checkpoint；重复跳过、缺口回滚。`ProjectionPipeline` 串起补缺口去重与批量写库，写库失败即复位并从数据库 `last_seq` 重来；`KafkaProjectionRunner` 先落库再提交 offset；`ProjectionAuditor` 把投影与日志重放得到的撮合状态逐账户、逐订单对账。测试在真实 MariaDB 11.4 上覆盖：随机流投影与引擎一致且资产守恒、重复/重叠批次得到相同终态、批内崩溃整批回滚、缺口拒绝、4 个并发写入者终态一致、对账能发现被篡改的余额和丢失的订单、Kafka 重投被吸收；并做过变异验证（去掉价格改善退款，对账立即报差异）。全链路测试：真实集群 + 人为丢事件 + 补数 + 写库 + 对账一致。
 * 事件出口：Aeron IPC → 独立发布线程 → `EventSink`（Kafka 幂等 Producer 或日志）；Kafka 路径仅用 `MockProducer` 验证，未连真实 broker。
 * 请求方确认：leader 通过 egress 把 ACCEPTED/REJECTED/CANCELLED/TRADE 回写给下单会话。
 
@@ -126,6 +127,8 @@ Raft Log / 快照 → S3 归档 → 离线确定性重放 ⇄ 对账 ⇄ MySQL �
 * 仅限价 GTC：无市价、IOC/FOK、自成交保护、手续费、最小价格/数量单位校验。
 * 撤单在同价位队列中线性查找（O(n)），生产需要侵入式链表。
 * 补数每次从日志起点重放（O(日志长度)），日志起点必须为 0；补数源是某个成员的 Archive，尚未对接 S3 归档。
-* Flink 清算与 MySQL/ES 投影、离线稽核重放流水线、行情 UDP 旁路均未实现。
+* 投影用普通消费者实现，未做成 Flink 作业；Elasticsearch 投影、离线稽核的定时流水线、行情 UDP 旁路未实现。投影在 MariaDB 上验证，未在 MySQL 官方发行版上跑过（SQL 使用两者共有的语法）。
+* 投影写入是单线程串行（一个 checkpoint 行），吞吐上限未压测；分库分表或按账户并行需要另行设计 checkpoint 方案。
+* 对账只在投影追平日志头时有意义，尚无“截至某个命令边界”的对账。
 * 事件发布进程内的去重器重启后状态清零（原因见 §3），只作尽力过滤；真正的去重与缺口检测在消费端。
 * `clientOrderId` 去重集合只增不减（见 §7 第 5 项）。
