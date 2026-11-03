@@ -28,6 +28,18 @@ public final class MatchingEngine {
     private static final class Account {
         final long[] available = new long[3]; // 下标为 asset：1=base，2=quote
         final long[] frozen = new long[3];
+
+        /** 受检地同时改变可用与冻结。任何一边溢出或变负都是程序缺陷：先算后赋值，不留下半截状态。 */
+        void apply(int asset, long dAvailable, long dFrozen) {
+            final long na = Math.addExact(available[asset], dAvailable);
+            final long nf = Math.addExact(frozen[asset], dFrozen);
+            if (na < 0 || nf < 0) {
+                throw new InvariantViolation("negative balance: asset=" + asset + " available " + available[asset] + "→" + na
+                        + ", frozen " + frozen[asset] + "→" + nf);
+            }
+            available[asset] = na;
+            frozen[asset] = nf;
+        }
     }
 
     private static final class Order {
@@ -67,6 +79,17 @@ public final class MatchingEngine {
     private final TreeMap<ClientKey, Long> cancelOutcomes = new TreeMap<>();
     /** 已入账的入金：key=(账户, depositId)，value=金额。重试同一笔入金时返回原结果，绝不重复入账。 */
     private final TreeMap<ClientKey, Long> depositOutcomes = new TreeMap<>();
+    /** 每种资产总供应量上限：保证任何账户余额之和都不会让 long 溢出（设计 §0 第 1 点：先校验、后改状态）。 */
+    public static final long MAX_SUPPLY = Long.MAX_VALUE / 4;
+    /** 快照格式：魔数 + 版本 + 正文 + SHA-256。 */
+    private static final int SNAPSHOT_MAGIC = 0x4E58454E; // "NEXN"
+    public static final int SNAPSHOT_VERSION = 3;
+    /** 每多少个事件产生一个链式哈希检查点（属于状态机语义，改它要升版本）。 */
+    public static final long CHECKPOINT_INTERVAL = 1_000;
+    private final long[] supply = new long[3]; // 已入账的总额，下标为 asset
+    /** 对全部输出事件的链式哈希：同样的日志重放必须得到同样的值，不同则说明副本分歧、日志损坏或语义变了。 */
+    private long chain;
+    private long nextCheckpointSeq = CHECKPOINT_INTERVAL;
     private long nextOrderId = 1;
     private long nextEventSeq = 1;
 
@@ -107,13 +130,13 @@ public final class MatchingEngine {
             emit(EVT_REJECTED, 0, 0, accountId, prior, REJECT_DUPLICATE_DEPOSIT, depositId, 0);
             return;
         }
-        final Account a = accounts.computeIfAbsent(accountId, k -> new Account());
-        try {
-            a.available[asset] = Math.addExact(a.available[asset], amount);
-        } catch (ArithmeticException e) {
-            emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_OVERFLOW, 0, 0);
+        if (supply[asset] > MAX_SUPPLY - amount) { // 先校验：超过总供应量上限直接拒绝，不改任何状态
+            emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_OVERFLOW, depositId, 0);
             return;
         }
+        final Account a = accounts.computeIfAbsent(accountId, k -> new Account());
+        a.apply(asset, amount, 0);
+        supply[asset] += amount;
         depositOutcomes.put(key, amount);
         emit(EVT_DEPOSITED, 0, 0, accountId, asset, amount, depositId, 0);
     }
@@ -147,8 +170,7 @@ public final class MatchingEngine {
             return;
         }
         // 先冻结，后撮合
-        acct.available[freezeAsset] -= freezeAmount;
-        acct.frozen[freezeAsset] += freezeAmount;
+        acct.apply(freezeAsset, -freezeAmount, freezeAmount);
 
         final Order taker = new Order(nextOrderId++, accountId, side, price, qty);
         placeOutcomes.put(key, taker.id);
@@ -198,13 +220,18 @@ public final class MatchingEngine {
 
     /** 以 maker 的价格成交；买方按自己限价冻结的差额退回（价格改善）。 */
     private void settle(Order buy, Order sell, long tradePrice, long fill) {
+        if (fill <= 0 || buy.price < tradePrice) {
+            throw new InvariantViolation("bad trade: fill=" + fill + " tradePrice=" + tradePrice + " buyLimit=" + buy.price);
+        }
         final Account b = accounts.get(buy.account);
         final Account s = accounts.get(sell.account);
-        b.frozen[ASSET_QUOTE] -= buy.price * fill;                       // 释放按限价冻结的部分
-        b.available[ASSET_QUOTE] += (buy.price - tradePrice) * fill;     // 退还价格改善
-        b.available[ASSET_BASE] += fill;
-        s.frozen[ASSET_BASE] -= fill;
-        s.available[ASSET_QUOTE] += tradePrice * fill;
+        final long buyerFrozen = Math.multiplyExact(buy.price, fill);               // 按限价冻结的部分
+        final long refund = Math.multiplyExact(buy.price - tradePrice, fill);       // 价格改善退还
+        final long proceeds = Math.multiplyExact(tradePrice, fill);                 // 卖方所得
+        b.apply(ASSET_QUOTE, refund, -buyerFrozen);
+        b.apply(ASSET_BASE, fill, 0);
+        s.apply(ASSET_BASE, 0, -fill);
+        s.apply(ASSET_QUOTE, proceeds, 0);
     }
 
     private void cancel(long accountId, long orderId) {
@@ -229,19 +256,56 @@ public final class MatchingEngine {
         cancelOutcomes.put(new ClientKey(accountId, orderId), o.remaining);
         final Account a = accounts.get(accountId);
         if (o.side == SIDE_BUY) {
-            final long amt = o.price * o.remaining;
-            a.frozen[ASSET_QUOTE] -= amt;
-            a.available[ASSET_QUOTE] += amt;
+            final long amt = Math.multiplyExact(o.price, o.remaining);
+            a.apply(ASSET_QUOTE, amt, -amt);
         } else {
-            a.frozen[ASSET_BASE] -= o.remaining;
-            a.available[ASSET_BASE] += o.remaining;
+            a.apply(ASSET_BASE, o.remaining, -o.remaining);
         }
         emit(EVT_CANCELLED, o.side, o.id, accountId, o.price, o.remaining, 0, 0);
     }
 
+    private static long mix(long h, long x) {
+        h ^= x;
+        h *= 0x9E3779B97F4A7C15L;
+        h ^= h >>> 32;
+        return h;
+    }
+
+    /**
+     * 命令处理完之后调用：如果事件序号越过了下一个检查点边界，返回 true 并填入 {最后事件序号, 链式哈希}。
+     * 边界由状态机自己确定（属于状态、随快照持久化），所有副本在同一个日志位置得到同一个检查点。
+     */
+    public boolean takeCheckpoint(long[] out) {
+        final long last = nextEventSeq - 1;
+        if (last < nextCheckpointSeq) {
+            return false;
+        }
+        out[0] = last;
+        out[1] = chain;
+        nextCheckpointSeq = (last / CHECKPOINT_INTERVAL + 1) * CHECKPOINT_INTERVAL;
+        return true;
+    }
+
+    public long chainHash() { return chain; }
+
+    /** 仅测试：模拟“新代码的语义与旧日志不一致”（订单号编码变了）。 */
+    public void skewNextOrderIdForTest(long delta) { nextOrderId += delta; }
+
     private void emit(int type, int aux, long orderId, long account, long price, long qty, long counterOrderId, long counterAccount) {
         // 参数顺序对 REJECTED/DEPOSITED 做了便捷复用：见 Protocol 注释
-        out.onEvent(type, aux, nextEventSeq++, now, orderId, account, price, qty, counterOrderId, counterAccount);
+        final long seq = nextEventSeq++;
+        long h = chain;
+        h = mix(h, type | ((long) aux << 32));
+        h = mix(h, seq);
+        h = mix(h, now);
+        h = mix(h, orderId);
+        h = mix(h, account);
+        h = mix(h, price);
+        h = mix(h, qty);
+        h = mix(h, counterOrderId);
+        h = mix(h, counterAccount);
+        chain = h;
+        out.onEvent(type, aux, seq, now, orderId, account, price, qty, counterOrderId, counterAccount);
     }
 
     // ---------- 只读访问（测试 / 运维） ----------
@@ -271,6 +335,56 @@ public final class MatchingEngine {
     public Long bestBid() { return bids.isEmpty() ? null : bids.firstKey(); }
 
     public Long bestAsk() { return asks.isEmpty() ? null : asks.firstKey(); }
+
+    /**
+     * 全量不变量检查（O(账户+订单)，不在热路径上调用；快照前、重放结束后、测试里调用）：
+     *  1. 所有余额非负；
+     *  2. 每种资产 可用+冻结 的总和 == 已入账总额（守恒）；
+     *  3. 每个账户的冻结额 == 它所有在簿订单所需冻结额之和（买单 price×remaining 的 quote，卖单 remaining 的 base）；
+     *  4. 在簿订单剩余量 > 0。
+     * 违反即抛 {@link InvariantViolation}。
+     */
+    public void verifyInvariants() {
+        final long[] held = new long[3];
+        for (Map.Entry<Long, Account> e : accounts.entrySet()) {
+            final Account a = e.getValue();
+            for (int asset = 1; asset <= 2; asset++) {
+                if (a.available[asset] < 0 || a.frozen[asset] < 0) {
+                    throw new InvariantViolation("negative balance on account " + e.getKey() + " asset " + asset);
+                }
+                held[asset] = Math.addExact(held[asset], Math.addExact(a.available[asset], a.frozen[asset]));
+            }
+        }
+        for (int asset = 1; asset <= 2; asset++) {
+            if (held[asset] != supply[asset]) {
+                throw new InvariantViolation("conservation broken for asset " + asset + ": held=" + held[asset] + " supply=" + supply[asset]);
+            }
+        }
+        final Map<Long, long[]> needed = new HashMap<>(); // 账户 → {base 冻结, quote 冻结}
+        for (int side : new int[]{SIDE_BUY, SIDE_SELL}) {
+            for (ArrayDeque<Order> level : book(side).values()) {
+                for (Order o : level) {
+                    if (o.remaining <= 0) {
+                        throw new InvariantViolation("resting order " + o.id + " has remaining " + o.remaining);
+                    }
+                    final long[] n = needed.computeIfAbsent(o.account, k -> new long[2]);
+                    if (o.side == SIDE_BUY) {
+                        n[1] = Math.addExact(n[1], Math.multiplyExact(o.price, o.remaining));
+                    } else {
+                        n[0] = Math.addExact(n[0], o.remaining);
+                    }
+                }
+            }
+        }
+        for (Map.Entry<Long, Account> e : accounts.entrySet()) {
+            final long[] n = needed.getOrDefault(e.getKey(), new long[2]);
+            final Account a = e.getValue();
+            if (a.frozen[ASSET_BASE] != n[0] || a.frozen[ASSET_QUOTE] != n[1]) {
+                throw new InvariantViolation("frozen funds of account " + e.getKey() + " do not match its resting orders: frozen=["
+                        + a.frozen[ASSET_BASE] + "," + a.frozen[ASSET_QUOTE] + "] needed=[" + n[0] + "," + n[1] + "]");
+            }
+        }
+    }
 
     // ---------- 稽核用的只读遍历（顺序确定） ----------
 
@@ -305,12 +419,18 @@ public final class MatchingEngine {
 
     /** 序列化完整状态。遍历顺序全部有序，因此同一状态产生的字节完全一致，可直接用作状态哈希的输入。 */
     public byte[] snapshot() {
-        int orderCount = ordersById.size();
-        final ByteBuffer bb = ByteBuffer.allocate(
-                8 * 2 + 4 + accounts.size() * (8 + 8 * 4) + 4 + orderCount * (8 * 4 + 4) + 4 + placeOutcomes.size() * 24 + 4 + cancelOutcomes.size() * 24 + 4 + depositOutcomes.size() * 24)
-                .order(ByteOrder.LITTLE_ENDIAN);
+        final int orderCount = ordersById.size();
+        final long size = 8L * 2 + 16 + 16 + 4 + (long) accounts.size() * (8 + 8 * 4) + 4 + (long) orderCount * (8 * 4 + 4)
+                + 4 + (long) placeOutcomes.size() * 24 + 4 + (long) cancelOutcomes.size() * 24 + 4 + (long) depositOutcomes.size() * 24;
+        if (size > Integer.MAX_VALUE - 1024) {
+            // 数组放不下：明确失败（由服务 fail-stop），而不是整数溢出后生成一份残缺快照
+            throw new IllegalStateException("state too large to snapshot in one array: " + size + " bytes");
+        }
+        final ByteBuffer bb = ByteBuffer.allocate((int) size).order(ByteOrder.LITTLE_ENDIAN);
         bb.putLong(nextOrderId);
         bb.putLong(nextEventSeq);
+        bb.putLong(supply[ASSET_BASE]).putLong(supply[ASSET_QUOTE]);
+        bb.putLong(chain).putLong(nextCheckpointSeq);
         bb.putInt(accounts.size());
         for (Map.Entry<Long, Account> e : accounts.entrySet()) {
             bb.putLong(e.getKey());
@@ -338,14 +458,56 @@ public final class MatchingEngine {
         for (Map.Entry<ClientKey, Long> e : depositOutcomes.entrySet()) {
             bb.putLong(e.getKey().account).putLong(e.getKey().clientOrderId).putLong(e.getValue());
         }
-        return bb.array();
+        return frame(bb.array());
+    }
+
+    /** [魔数][版本][正文][SHA-256(前面全部)]：损坏、截断、版本不符都能在加载时被发现。 */
+    private static byte[] frame(byte[] body) {
+        final ByteBuffer out = ByteBuffer.allocate(8 + body.length + 32).order(ByteOrder.LITTLE_ENDIAN);
+        out.putInt(SNAPSHOT_MAGIC).putInt(SNAPSHOT_VERSION).put(body);
+        out.put(sha256(out.array(), 0, 8 + body.length));
+        return out.array();
+    }
+
+    private static byte[] unframe(byte[] data) {
+        if (data == null || data.length < 8 + 32) {
+            throw new SnapshotCorruptException("snapshot too short: " + (data == null ? -1 : data.length));
+        }
+        final ByteBuffer in = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        if (in.getInt(0) != SNAPSHOT_MAGIC) {
+            throw new SnapshotCorruptException("bad snapshot magic");
+        }
+        if (in.getInt(4) != SNAPSHOT_VERSION) {
+            throw new SnapshotCorruptException("incompatible snapshot version " + in.getInt(4) + ", expected " + SNAPSHOT_VERSION);
+        }
+        final byte[] expected = sha256(data, 0, data.length - 32);
+        for (int i = 0; i < 32; i++) {
+            if (expected[i] != data[data.length - 32 + i]) {
+                throw new SnapshotCorruptException("snapshot checksum mismatch");
+            }
+        }
+        return java.util.Arrays.copyOfRange(data, 8, data.length - 32);
+    }
+
+    private static byte[] sha256(byte[] d, int off, int len) {
+        try {
+            final MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update(d, off, len);
+            return md.digest();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     public static MatchingEngine fromSnapshot(byte[] data) {
-        final ByteBuffer bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        final ByteBuffer bb = ByteBuffer.wrap(unframe(data)).order(ByteOrder.LITTLE_ENDIAN);
         final MatchingEngine e = new MatchingEngine();
         e.nextOrderId = bb.getLong();
         e.nextEventSeq = bb.getLong();
+        e.supply[ASSET_BASE] = bb.getLong();
+        e.supply[ASSET_QUOTE] = bb.getLong();
+        e.chain = bb.getLong();
+        e.nextCheckpointSeq = bb.getLong();
         int n = bb.getInt();
         for (int i = 0; i < n; i++) {
             final long id = bb.getLong();
@@ -384,7 +546,7 @@ public final class MatchingEngine {
 
     /** 不还原整个引擎，直接从快照字节读出最后事件序号（布局：nextOrderId, nextEventSeq, ...）。 */
     public static long lastEventSeqOfSnapshot(byte[] data) {
-        return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getLong(8) - 1;
+        return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getLong(8 + 8) - 1; // 跳过 8 字节帧头和 nextOrderId
     }
 
     public String stateHash() {

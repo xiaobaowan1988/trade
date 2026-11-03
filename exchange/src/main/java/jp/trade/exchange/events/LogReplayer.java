@@ -23,6 +23,8 @@ import org.agrona.ExpandableArrayBuffer;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 
+import static jp.trade.exchange.core.Protocol.CHECKPOINT_LENGTH;
+import static jp.trade.exchange.core.Protocol.CHECKPOINT_MAGIC;
 import static jp.trade.exchange.core.Protocol.EVENT_LENGTH;
 import static jp.trade.exchange.core.Protocol.encodeEvent;
 
@@ -40,6 +42,7 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
     private final Aeron aeron;
     private final AeronArchive archive;
     private volatile String lastSeed = "none";
+    private volatile long checkpointsVerified;
     private final ArchiveCatalog catalog; // 可为 null：只用本地日志
 
     /**
@@ -160,6 +163,8 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
 
         final MessageHeaderDecoder header = new MessageHeaderDecoder();
         final SessionMessageHeaderDecoder session = new SessionMessageHeaderDecoder();
+        final java.util.TreeMap<Long, Long> pendingChecks = new java.util.TreeMap<>();
+        final long[] checkpointOut = new long[2];
         // 对象存储与本地 Archive 两条读取路径共用同一个“日志消息 → 命令”的处理
         final AeronFrames.MessageHandler onMessage = (DirectBuffer buf, int offset, int length, long position) -> {
             header.wrap(buf, offset);
@@ -169,8 +174,26 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
             session.wrap(buf, offset + MessageHeaderDecoder.ENCODED_LENGTH, header.blockLength(), header.version());
             final int payloadOffset = offset + MessageHeaderDecoder.ENCODED_LENGTH + header.blockLength();
             final int payloadLength = length - MessageHeaderDecoder.ENCODED_LENGTH - header.blockLength();
+            // 服务自己发的检查点（服务会话号为负；客户端会话号为正，伪造不了）：不是命令，不能交给引擎，只用来核对
+            if (session.clusterSessionId() < 0 && payloadLength == CHECKPOINT_LENGTH && buf.getInt(payloadOffset) == CHECKPOINT_MAGIC) {
+                final long seq = buf.getLong(payloadOffset + 4);
+                final long recorded = buf.getLong(payloadOffset + 12);
+                final Long mine = pendingChecks.remove(seq);
+                if (mine == null) {
+                    return; // 例如检查点在快照之前发出、之后才到：无法核对
+                }
+                if (mine != recorded) {
+                    throw new IllegalStateException("log replay integrity failure: checkpoint mismatch at event seq " + seq
+                            + " (replayed " + mine + ", log recorded " + recorded + ")");
+                }
+                checkpointsVerified++;
+                return;
+            }
             // 时间戳取日志里记录的集群时间，与线上服务收到的 timestamp 一致
             seeded.onCommand(buf, payloadOffset, payloadLength, session.timestamp(), filter);
+            if (seeded.takeCheckpoint(checkpointOut)) { // 与线上服务在同一位置推进检查点边界，保持状态一致
+                pendingChecks.put(checkpointOut[0], checkpointOut[1]);
+            }
         };
 
         // ---- A. 本地已裁剪的部分：从对象存储读 [startPos, localStart) ----
@@ -273,6 +296,9 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
         }
         return reader.bytes();
     }
+
+    /** 重放过程中累计核对通过的链式哈希检查点数（日志完整性的独立证据）。 */
+    public long checkpointsVerified() { return checkpointsVerified; }
 
     /** 最近一次补数用的种子（测试/运维可见）：log-start 或 snapshot@位置。 */
     public String lastSeed() { return lastSeed; }

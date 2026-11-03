@@ -6,7 +6,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import jp.trade.exchange.core.InvariantViolation;
 import jp.trade.exchange.core.MatchingEngine;
+import jp.trade.exchange.core.SnapshotCorruptException;
 import org.agrona.ExpandableArrayBuffer;
 import org.junit.jupiter.api.Test;
 
@@ -160,6 +162,9 @@ class MatchingEngineTest {
                 restored = MatchingEngine.fromSnapshot(a.snapshot()); // 中途做快照并恢复
                 assertEquals(a.stateHash(), restored.stateHash());
             }
+            if (i % 500 == 0) {
+                a.verifyInvariants(); // 余额非负、守恒、冻结额与在簿订单一致
+            }
             assertEquals(depositedBase, a.totalHeld(ASSET_BASE), "base 守恒 @" + i);
             assertEquals(depositedQuote, a.totalHeld(ASSET_QUOTE), "quote 守恒 @" + i);
         }
@@ -258,5 +263,86 @@ class MatchingEngineTest {
         final MatchingEngine e = new MatchingEngine();
         assertEquals(REJECT_INVALID, depositWithId(e, 1, ASSET_QUOTE, 5_000, 0).get(0).qty);
         assertEquals(0, e.totalHeld(ASSET_QUOTE), "没有幂等键的入金不被接受");
+    }
+
+    // ---------- “服务可以挂，但不能出错”：数据安全 ----------
+
+    @Test
+    void depositBeyondTheSupplyCapIsRejectedBeforeAnyStateChange() {
+        final MatchingEngine e = new MatchingEngine();
+        assertEquals(EVT_DEPOSITED, deposit(e, 1, ASSET_QUOTE, MatchingEngine.MAX_SUPPLY - 10).get(0).type);
+        final List<Evt> over = deposit(e, 2, ASSET_QUOTE, 11);           // 总额会超过上限
+        assertEquals(REJECT_OVERFLOW, over.get(0).qty);
+        assertEquals(0, e.available(2, ASSET_QUOTE), "被拒绝的入金不能留下任何状态（包括凭空创建的账户）");
+        assertEquals(EVT_DEPOSITED, deposit(e, 2, ASSET_QUOTE, 10).get(0).type, "恰好到上限仍可入账");
+        e.verifyInvariants();
+    }
+
+    @Test
+    void extremeValuesNeverOverflowAndConservationHolds() {
+        final MatchingEngine e = new MatchingEngine();
+        final long half = MatchingEngine.MAX_SUPPLY / 2;
+        deposit(e, 1, ASSET_QUOTE, half);                 // 买方：约 1.15e18 JPY
+        deposit(e, 2, ASSET_BASE, 1_000_000_000L);        // 卖方：10 亿 lot
+        place(e, 2, SIDE_SELL, 1, half / 1_000_000_000L, 1_000_000_000L);   // 价格 × 数量 ≈ 全部余额
+        final List<Evt> buy = place(e, 1, SIDE_BUY, 1, half / 1_000_000_000L, 1_000_000_000L);
+        assertTrue(buy.stream().anyMatch(x -> x.type == EVT_TRADE));
+        e.verifyInvariants();
+        // 乘积溢出的订单在改状态之前就被拒绝
+        deposit(e, 3, ASSET_QUOTE, 1_000);
+        assertEquals(REJECT_OVERFLOW, place(e, 3, SIDE_BUY, 9, Long.MAX_VALUE / 2, 5).get(0).qty);
+        e.verifyInvariants();
+    }
+
+    private static void corrupt(MatchingEngine e, long account, int asset, long newFrozen) throws Exception {
+        final java.lang.reflect.Field f = MatchingEngine.class.getDeclaredField("accounts");
+        f.setAccessible(true);
+        final Object acct = ((java.util.Map<?, ?>) f.get(e)).get(account);
+        final java.lang.reflect.Field fr = acct.getClass().getDeclaredField("frozen");
+        fr.setAccessible(true);
+        ((long[]) fr.get(acct))[asset] = newFrozen;
+    }
+
+    @Test
+    void aCorruptedBalanceIsDetectedInsteadOfBeingServed() throws Exception {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 1_000);
+        place(e, 1, SIDE_BUY, 1, 100, 5);          // 冻结 500
+        e.verifyInvariants();
+        corrupt(e, 1, ASSET_QUOTE, 100);           // 模拟内存/逻辑错误：冻结额少于订单所需
+        assertThrows(InvariantViolation.class, e::verifyInvariants, "全量检查发现冻结额与在簿订单不一致");
+        // 即使没有全量检查，下一次触及这个账户的命令也会因为余额变负而抛出，而不是静默算出错误结果
+        assertThrows(InvariantViolation.class, () -> cancel(e, 1, 1));
+    }
+
+    @Test
+    void conservationBreakIsDetected() throws Exception {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 1_000);
+        corrupt(e, 1, ASSET_QUOTE, 7);             // 凭空多出 7 的冻结额
+        assertThrows(InvariantViolation.class, e::verifyInvariants);
+    }
+
+    @Test
+    void corruptedOrTruncatedOrIncompatibleSnapshotsAreRefused() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 10_000);
+        place(e, 1, SIDE_BUY, 1, 100, 10);
+        final byte[] snap = e.snapshot();
+        assertEquals(e.stateHash(), MatchingEngine.fromSnapshot(snap).stateHash(), "完好的快照可以加载");
+
+        for (int pos : new int[]{9, snap.length / 2, snap.length - 40}) {   // 正文里任意一个字节翻转
+            final byte[] bad = snap.clone();
+            bad[pos] ^= 0x01;
+            assertThrows(SnapshotCorruptException.class, () -> MatchingEngine.fromSnapshot(bad), "翻转字节 " + pos);
+        }
+        assertThrows(SnapshotCorruptException.class, () -> MatchingEngine.fromSnapshot(java.util.Arrays.copyOf(snap, snap.length - 1)), "截断");
+        assertThrows(SnapshotCorruptException.class, () -> MatchingEngine.fromSnapshot(new byte[10]), "太短");
+        final byte[] wrongVersion = snap.clone();
+        wrongVersion[4] ^= 0x7F;                                              // 版本号不符（连校验和也对不上，仍应被明确拒绝）
+        assertThrows(SnapshotCorruptException.class, () -> MatchingEngine.fromSnapshot(wrongVersion));
+        final byte[] wrongMagic = snap.clone();
+        wrongMagic[0] ^= 0x01;
+        assertThrows(SnapshotCorruptException.class, () -> MatchingEngine.fromSnapshot(wrongMagic));
     }
 }

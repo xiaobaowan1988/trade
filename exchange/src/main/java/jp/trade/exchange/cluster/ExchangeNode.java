@@ -17,6 +17,11 @@ import org.agrona.IoUtil;
 /** 单节点（成员数=1 的 Raft 组）集群：MediaDriver + Archive + ConsensusModule + 撮合服务 + 事件桥。 */
 public final class ExchangeNode implements AutoCloseable {
     public static final int PORT_BASE = 9000;
+    /**
+     * 状态机语义版本（major.minor.patch）。**任何改变命令处理结果的改动都必须升版本**（至少 major）：
+     * Aeron 会拒绝用不兼容版本加载旧快照/日志，而不是用新逻辑重放旧日志得到另一个状态。
+     */
+    public static final int STATE_MACHINE_VERSION = org.agrona.SemanticVersion.compose(1, 0, 0);
     public static final String HOST = "localhost";
 
     private final int memberId;
@@ -77,8 +82,14 @@ public final class ExchangeNode implements AutoCloseable {
                 .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)) // 默认 10s，缩短以加快故障切换
                 // Aeron 默认只允许 10 个并发会话；用户经网关复用进集群，所以这里按“网关数 + 运维连接”配置
                 .maxConcurrentSessions(1_000);
+        config.consensusModuleContext().appVersion(STATE_MACHINE_VERSION);
+        config.clusteredServiceContext().appVersion(STATE_MACHINE_VERSION);
         // 先持久、再确认：Aeron 默认 fileSyncLevel=0 只写页缓存，整机断电会丢“已确认”的订单。2=fsync 数据与元数据。
         config.archiveContext().fileSyncLevel(2).catalogFileSyncLevel(2);
+        // 存储完整性：录制时为每个帧计算 CRC32C，重放时校验。静默位翻转会被发现，而不是变成“另一条合法的命令”
+        config.archiveContext()
+                .recordChecksum(io.aeron.archive.checksum.Checksums.crc32c())
+                .replayChecksum(io.aeron.archive.checksum.Checksums.crc32c());
         config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
 
         customizer.accept(config);

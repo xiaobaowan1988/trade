@@ -84,8 +84,22 @@ public final class JdbcProjector {
                 throw t;
             }
         } catch (SQLException e) {
+            if (isIntegrityViolation(e)) {
+                throw new ProjectionIntegrityException("projection rejected an inconsistent batch: " + e.getMessage(), e);
+            }
             throw new IllegalStateException(e);
         }
+    }
+
+    /** SQLState 23xxx（完整性约束，含 CHECK、主键重复）：不是瞬时故障，不能重试。 */
+    private static boolean isIntegrityViolation(SQLException e) {
+        for (SQLException x = e; x != null; x = x.getNextException()) {
+            if (x instanceof java.sql.SQLIntegrityConstraintViolationException
+                    || (x.getSQLState() != null && x.getSQLState().startsWith("23"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static long lockCheckpoint(Connection c) throws SQLException {
@@ -144,7 +158,7 @@ public final class JdbcProjector {
                 }
             }
             case EVT_REJECTED -> { /* 无状态变化，只推进 checkpoint */ }
-            default -> throw new IllegalStateException("unknown event type " + type);
+            default -> throw new ProjectionIntegrityException("unknown event type " + type + " (state machine version mismatch?)");
         }
     }
 
@@ -205,7 +219,7 @@ public final class JdbcProjector {
             orderPrice.setLong(1, orderId);
             try (ResultSet rs = orderPrice.executeQuery()) {
                 if (!rs.next()) {
-                    throw new IllegalStateException("order " + orderId + " missing in projection");
+                    throw new ProjectionIntegrityException("order " + orderId + " missing in projection");
                 }
                 return rs.getLong(1);
             }
@@ -229,18 +243,26 @@ public final class JdbcProjector {
         }
 
         void flush() throws SQLException {
-            // 1. 余额：每个受影响的 (账户, 资产) 一条增量 upsert
-            try (PreparedStatement ps = c.prepareStatement(
-                    "INSERT INTO account_balance (account_id, asset, available, frozen) VALUES (?, ?, ?, ?) "
-                            + "ON DUPLICATE KEY UPDATE available = available + VALUES(available), frozen = frozen + VALUES(frozen)")) {
+            // 1. 余额：先确保行存在（INSERT IGNORE 零行），再对每个受影响的 (账户, 资产) 加一条增量。
+            //    不能用 INSERT ... ON DUPLICATE KEY UPDATE 直接插增量：MariaDB/MySQL 会先对“插入元组”检查 CHECK，
+            //    而增量常常是负的（比如冻结 500 就是 available = -500），即使合并后的结果是合法的也会被拒绝。
+            //    这样 CHECK（余额非负）只作用于最终结果，作为数据库的最后一道防线。
+            try (PreparedStatement ensure = c.prepareStatement(
+                         "INSERT IGNORE INTO account_balance (account_id, asset, available, frozen) VALUES (?, ?, 0, 0)");
+                 PreparedStatement add = c.prepareStatement(
+                         "UPDATE account_balance SET available = available + ?, frozen = frozen + ? WHERE account_id = ? AND asset = ?")) {
                 for (java.util.Map.Entry<Long, long[]> e : balances.entrySet()) {
-                    ps.setLong(1, e.getKey() / 4);
-                    ps.setInt(2, (int) (e.getKey() % 4));
-                    ps.setLong(3, e.getValue()[0]);
-                    ps.setLong(4, e.getValue()[1]);
-                    ps.addBatch();
+                    ensure.setLong(1, e.getKey() / 4);
+                    ensure.setInt(2, (int) (e.getKey() % 4));
+                    ensure.addBatch();
+                    add.setLong(1, e.getValue()[0]);
+                    add.setLong(2, e.getValue()[1]);
+                    add.setLong(3, e.getKey() / 4);
+                    add.setInt(4, (int) (e.getKey() % 4));
+                    add.addBatch();
                 }
-                ps.executeBatch();
+                ensure.executeBatch();
+                add.executeBatch();
             }
             // 2. 订单：本批新建的一次插入（带最终状态）；已存在的按增量更新
             try (PreparedStatement ins = c.prepareStatement(

@@ -33,6 +33,10 @@ public final class Protocol {
     public static final int CMD_CANCEL = 3;
     public static final int COMMAND_LENGTH = 48;
 
+    /** 日志里的链式哈希检查点消息（服务自己发的）：int 魔数 | long 最后事件序号 | long 链式哈希。 */
+    public static final int CHECKPOINT_MAGIC = 0x4E584348; // "NXCH"
+    public static final int CHECKPOINT_LENGTH = 4 + 8 + 8;
+
     // 事件类型
     public static final int EVT_ACCEPTED = 1;   // orderId, account, price, qty, counterOrderId=clientOrderId, aux=side
     public static final int EVT_REJECTED = 2;   // account, counterOrderId=clientOrderId(或 orderId), qty=reason；DUPLICATE_CLIENT_ORDER 时 orderId=原订单号、price=原拒绝原因

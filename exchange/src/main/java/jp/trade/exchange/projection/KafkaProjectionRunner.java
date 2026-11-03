@@ -27,6 +27,7 @@ public final class KafkaProjectionRunner {
     private long lastCatchUp = System.currentTimeMillis();
     private final AtomicLong failures = new AtomicLong();
     private volatile Throwable lastError;
+    private volatile Throwable fatalError;
 
     public KafkaProjectionRunner(Consumer<byte[], byte[]> kafka, ProjectionPipeline pipeline) {
         this(kafka, pipeline, 5_000);
@@ -65,6 +66,12 @@ public final class KafkaProjectionRunner {
             try {
                 pollOnce(pollTimeout);
                 backoffMs = 50;
+            } catch (ProjectionIntegrityException e) {
+                // 不可重试：数据不自洽。停下并留下原因，等人处理；绝不继续写入
+                failures.incrementAndGet();
+                lastError = e;
+                fatalError = e;
+                return;
             } catch (RuntimeException e) {
                 failures.incrementAndGet();
                 lastError = e;
@@ -82,4 +89,7 @@ public final class KafkaProjectionRunner {
     public long failures() { return failures.get(); }
 
     public Throwable lastError() { return lastError; }
+
+    /** 非 null 表示运行循环因数据不自洽而停止，需要人工介入。 */
+    public Throwable fatalError() { return fatalError; }
 }

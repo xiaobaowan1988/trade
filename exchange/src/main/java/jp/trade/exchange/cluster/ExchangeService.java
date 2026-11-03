@@ -14,6 +14,7 @@ import jp.trade.exchange.core.SnapshotFraming;
 import jp.trade.exchange.events.EventBridge;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
+import org.agrona.concurrent.AgentTerminationException;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 
@@ -39,6 +40,21 @@ public final class ExchangeService implements ClusteredService {
     private long droppedEvents;
     private volatile long egressDropped;
     private volatile boolean loadedFromSnapshot;
+    // ---- 链式哈希检查点（设计 §0 第 6 点）----
+    private static final int CHECK_MAGIC = CHECKPOINT_MAGIC;
+    private static final int CHECK_LENGTH = CHECKPOINT_LENGTH;
+    private final java.util.TreeMap<Long, Long> pendingChecks = new java.util.TreeMap<>();
+    private final long[] checkpointOut = new long[2];
+    private final ExpandableArrayBuffer checkBuf = new ExpandableArrayBuffer(CHECK_LENGTH);
+    private volatile long checkpointsSent;
+    private volatile long checkpointsVerified;
+    private volatile long checkpointsUnverifiable;
+    private volatile boolean halted;
+    private volatile Throwable fatalCause;
+    private java.util.function.Consumer<Throwable> fatalHandler = ExchangeService::haltJvm;
+    /** 测试用故障注入：处理第 N 条命令时抛异常（0=关闭）。 */
+    private volatile long injectFailureAtCommand;
+    private long commandCount;
     private volatile Cluster.Role role = Cluster.Role.FOLLOWER;
 
     // ---- 事件发布缓冲背压策略（“可以慢，不能丢”）----
@@ -72,7 +88,12 @@ public final class ExchangeService implements ClusteredService {
         this.cluster = cluster;
         this.eventPublication = cluster.aeron().addPublication(eventChannel, EventBridge.STREAM_ID);
         if (snapshotImage != null) {
-            loadSnapshot(snapshotImage);
+            try {
+                loadSnapshot(snapshotImage);
+                engine.verifyInvariants(); // 加载出来的状态也要自洽，否则宁可起不来
+            } catch (Throwable t) {
+                fatal("cannot load a trustworthy snapshot", t);
+            }
             loadedFromSnapshot = true;
         }
     }
@@ -85,11 +106,105 @@ public final class ExchangeService implements ClusteredService {
 
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer, int offset, int length, Header header) {
-        leader = cluster.role() == Cluster.Role.LEADER;
-        currentSession = leader ? session : null;
-        engine.onCommand(buffer, offset, length, timestamp, handler);
-        currentSession = null;
+        if (halted) {
+            throw new AgentTerminationException("service is halted (fail-stop)");
+        }
+        try {
+            if (session == null && length == CHECK_LENGTH && buffer.getInt(offset) == CHECK_MAGIC) {
+                // 服务自己发的消息到达时 session 为 null；客户端会话永远非 null，所以客户端伪造不了检查点
+                // 日志里的检查点消息：用本副本自己算出的值核对
+                onCheckpointMessage(session, buffer, offset);
+                return;
+            }
+            leader = cluster.role() == Cluster.Role.LEADER;
+            currentSession = leader ? session : null;
+            if (++commandCount == injectFailureAtCommand) {
+                throw new IllegalStateException("injected failure at command " + commandCount);
+            }
+            engine.onCommand(buffer, offset, length, timestamp, handler);
+            if (engine.takeCheckpoint(checkpointOut)) {
+                sendCheckpoint(checkpointOut[0], checkpointOut[1]);
+            }
+        } catch (AgentTerminationException e) {
+            throw e;
+        } catch (Throwable t) { // 包括 Error（OOM 等）。绝不“记录一下继续”，见设计 §0 第 3 点
+            fatal("state machine failed while applying command #" + commandCount, t);
+        } finally {
+            currentSession = null;
+        }
     }
+
+    private void sendCheckpoint(long seq, long chain) {
+        pendingChecks.put(seq, chain);
+        while (pendingChecks.size() > 10_000) {
+            pendingChecks.pollFirstEntry(); // 有界：发出去却一直没收到的检查点不会让内存无限增长
+        }
+        checkBuf.putInt(0, CHECK_MAGIC);
+        checkBuf.putLong(4, seq);
+        checkBuf.putLong(12, chain);
+        // 所有副本在同一个逻辑位置做同一个调用；Aeron 保证日志里只追加一份（以 leader 的为准）
+        if (cluster.offer(checkBuf, 0, CHECK_LENGTH) >= 0) {
+            checkpointsSent++;
+        }
+    }
+
+    private void onCheckpointMessage(ClientSession session, DirectBuffer buffer, int offset) {
+        final long seq = buffer.getLong(offset + 4);
+        final long theirs = buffer.getLong(offset + 12);
+        final Long mine = pendingChecks.remove(seq);
+        if (mine == null) {
+            checkpointsUnverifiable++; // 例如从快照恢复后收到快照之前发出的检查点：无法核对，不算通过
+            return;
+        }
+        if (mine != theirs) {
+            throw new IllegalStateException("checkpoint mismatch at event seq " + seq + ": this replica computed " + mine
+                    + " but the log recorded " + theirs + " (replica divergence, log corruption, or changed semantics)");
+        }
+        checkpointsVerified++;
+    }
+
+    public long checkpointsSent() { return checkpointsSent; }
+    public long checkpointsVerified() { return checkpointsVerified; }
+    public long checkpointsUnverifiable() { return checkpointsUnverifiable; }
+
+    /** 仅测试：让引擎的语义与旧日志不一致。 */
+    public ExchangeService skewForTest(long orderIdDelta) {
+        engine.skewNextOrderIdForTest(orderIdDelta);
+        return this;
+    }
+
+    /**
+     * fail-stop：状态机里出现任何无法证明正确的情况都停下。AgentRunner 对普通异常只会记录并继续下一轮，
+     * 而该命令的日志位置已经前移，状态可能只改了一半，所有副本还会确定性地一起错。
+     * 停机不丢数据：日志里的命令还在，修复后重放即可。
+     */
+    private void fatal(String what, Throwable cause) {
+        halted = true;
+        fatalCause = cause;
+        try {
+            fatalHandler.accept(new IllegalStateException(what, cause));
+        } catch (Throwable ignored) {
+            // 处理器本身失败也必须继续停机
+        }
+        throw new AgentTerminationException("fail-stop: " + what);
+    }
+
+    private static void haltJvm(Throwable t) {
+        System.err.println("FATAL: exchange state machine fail-stop; halting JVM so another member can take over");
+        t.printStackTrace();
+        System.err.flush();
+        Runtime.getRuntime().halt(70);
+    }
+
+    /** 自定义致命错误处理（默认：打印并 halt JVM）。测试里用来记录而不杀掉测试进程。 */
+    public ExchangeService fatalHandler(java.util.function.Consumer<Throwable> handler) {
+        this.fatalHandler = handler;
+        return this;
+    }
+
+    public boolean halted() { return halted; }
+
+    public Throwable fatalCause() { return fatalCause; }
 
     private void onEngineEvent(int type, int aux, long seq, long ts, long orderId, long account,
                                long price, long qty, long counterOrderId, long counterAccount) {
@@ -164,7 +279,14 @@ public final class ExchangeService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
-        final byte[] state = engine.snapshot();
+        final byte[] state;
+        try {
+            engine.verifyInvariants(); // 不对违反不变量的状态做快照：一份错误的快照会被所有后续恢复继承
+            state = engine.snapshot();
+        } catch (Throwable t) {
+            fatal("state failed pre-snapshot verification", t);
+            return;
+        }
         final MutableDirectBuffer buf = new ExpandableArrayBuffer(SnapshotFraming.HEADER + SnapshotFraming.CHUNK);
         for (int off = 0; off < state.length; off += SnapshotFraming.CHUNK) {
             final int len = SnapshotFraming.encodeChunk(buf, state, off);
@@ -214,4 +336,10 @@ public final class ExchangeService implements ClusteredService {
     public Cluster.Role role() { return role; }
 
     public boolean loadedFromSnapshot() { return loadedFromSnapshot; }
+
+    /** 仅测试：让第 N 条命令抛异常。 */
+    public ExchangeService injectFailureAtCommand(long n) {
+        this.injectFailureAtCommand = n;
+        return this;
+    }
 }

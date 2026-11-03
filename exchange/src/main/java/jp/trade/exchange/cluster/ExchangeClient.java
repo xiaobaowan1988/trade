@@ -61,11 +61,24 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
         final long deadline = System.currentTimeMillis() + 30_000;
         while ((r = cluster.offer(buf, 0, len)) < 0) {
             // NOT_CONNECTED/ADMIN_ACTION 等在 leader 切换期间是暂时的：继续 pollEgress 以接收新 leader 通知后重试
-            if (r == io.aeron.Publication.MAX_POSITION_EXCEEDED || System.currentTimeMillis() > deadline) {
+            if (r == io.aeron.Publication.CLOSED || r == io.aeron.Publication.MAX_POSITION_EXCEEDED || System.currentTimeMillis() > deadline) {
                 throw new IllegalStateException("offer failed: " + r);
             }
             cluster.pollEgress();
             idle.idle();
+        }
+    }
+
+    /** 仅测试：发送任意字节（例如构造恶意消息）。 */
+    public void sendRawForTest(byte[] payload) {
+        final ExpandableArrayBuffer b = new ExpandableArrayBuffer(payload.length);
+        b.putBytes(0, payload);
+        long r;
+        while ((r = cluster.offer(b, 0, payload.length)) < 0) {
+            if (r == io.aeron.Publication.CLOSED) {
+                throw new IllegalStateException("closed");
+            }
+            cluster.pollEgress();
         }
     }
 
