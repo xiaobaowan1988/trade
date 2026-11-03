@@ -64,6 +64,10 @@ public final class LoadRunner {
         final File dir = Files.createTempDirectory("exch-load").toFile();
         final ExchangeNode node = ExchangeNode.start(0, 1, dir, true, sink, cfg -> {
             cfg.consensusModuleContext().maxConcurrentSessions(1_000);
+            final int sync = Integer.getInteger("sync", -1); // 0=不 fsync 1=fdatasync 2=fsync；-1 沿用节点默认
+            if (sync >= 0) {
+                cfg.archiveContext().fileSyncLevel(sync).catalogFileSyncLevel(sync);
+            }
             cfg.errorHandler(t -> {
                 if (nodeErrors.incrementAndGet() <= 5) {
                     t.printStackTrace();

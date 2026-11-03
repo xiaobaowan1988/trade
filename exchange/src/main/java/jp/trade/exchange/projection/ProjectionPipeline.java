@@ -21,18 +21,29 @@ public final class ProjectionPipeline implements EventSink {
         this.projector = projector;
         this.backfill = backfill;
         this.batchSize = batchSize;
-        reset();
     }
 
+    /**
+     * 丢弃缓冲，并让消费者在下次使用时从数据库 last_seq 重建。
+     * 必须是“惰性”的：复位的那一刻数据库往往正是不可用的，如果在这里读 checkpoint 失败，
+     * 会留下一个进度领先于数据库的消费者，静默跳过事件。惰性重建失败时保持“待重建”，下次再试。
+     */
     public synchronized void reset() {
         buffer.clear();
-        consumer = new GapFillingConsumer(projector.checkpoint(), backfill, buffer::add);
+        consumer = null;
+    }
+
+    private GapFillingConsumer consumer() {
+        if (consumer == null) {
+            consumer = new GapFillingConsumer(projector.checkpoint(), backfill, buffer::add); // 失败则抛出，consumer 仍为 null
+        }
+        return consumer;
     }
 
     @Override
     public synchronized void publish(long seq, byte[] event) {
         try {
-            consumer.publish(seq, event);
+            consumer().publish(seq, event);
         } catch (RuntimeException e) {
             reset();
             throw e;
@@ -59,7 +70,7 @@ public final class ProjectionPipeline implements EventSink {
     /** 周期性调用：补齐尾部缺口并落库。 */
     public synchronized void catchUpToHead() {
         try {
-            consumer.catchUpToHead();
+            consumer().catchUpToHead();
         } catch (RuntimeException e) {
             reset();
             throw e;
@@ -67,5 +78,5 @@ public final class ProjectionPipeline implements EventSink {
         flush();
     }
 
-    public synchronized long lastSeqInMemory() { return consumer.lastSeq(); }
+    public synchronized long lastSeqInMemory() { return consumer == null ? projector.checkpoint() : consumer.lastSeq(); }
 }

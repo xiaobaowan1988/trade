@@ -69,7 +69,15 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
         }
     }
 
-    public void deposit(long account, int asset, long amount) { send(CMD_DEPOSIT, asset, account, amount, 0, 0); }
+    /** 入金（自动生成随机 depositId；需要超时重试同一笔入金时用带 depositId 的重载）。 */
+    public void deposit(long account, int asset, long amount) {
+        deposit(account, asset, amount, java.util.concurrent.ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE));
+    }
+
+    /** 入金是幂等的：同一 (account, depositId) 只会入账一次，重试返回 REJECTED(DUPLICATE_DEPOSIT)。 */
+    public void deposit(long account, int asset, long amount, long depositId) {
+        send(CMD_DEPOSIT, asset, account, amount, depositId, 0);
+    }
 
     public void place(long account, int side, long clientOrderId, long price, long qty) {
         send(CMD_PLACE, side, account, clientOrderId, price, qty);

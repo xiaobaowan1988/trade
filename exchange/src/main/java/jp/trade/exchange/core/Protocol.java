@@ -8,7 +8,7 @@ import org.agrona.DirectBuffer;
  * 全部小端；金额/数量/价格均为 long 定点整数，无浮点。
  *
  * 命令 (48B): int type | int aux | long account | long f1 | long f2 | long f3
- *   DEPOSIT: aux=asset, f1=amount
+ *   DEPOSIT: aux=asset, f1=amount, f2=depositId（幂等键，每账户内唯一，必须 > 0）
  *   PLACE  : aux=side,  f1=clientOrderId, f2=price, f3=qty
  *   CANCEL : f1=orderId
  *
@@ -35,10 +35,10 @@ public final class Protocol {
 
     // 事件类型
     public static final int EVT_ACCEPTED = 1;   // orderId, account, price, qty, counterOrderId=clientOrderId, aux=side
-    public static final int EVT_REJECTED = 2;   // account, counterOrderId=clientOrderId(或 orderId), qty=reason
+    public static final int EVT_REJECTED = 2;   // account, counterOrderId=clientOrderId(或 orderId), qty=reason；DUPLICATE_CLIENT_ORDER 时 orderId=原订单号、price=原拒绝原因
     public static final int EVT_TRADE = 3;      // orderId=taker, counterOrderId=maker, account=taker, counterAccount=maker, aux=takerSide
     public static final int EVT_CANCELLED = 4;  // orderId, account, qty=剩余数量
-    public static final int EVT_DEPOSITED = 5;  // account, price=asset, qty=amount
+    public static final int EVT_DEPOSITED = 5;  // account, price=asset, qty=amount, counterOrderId=depositId
     public static final int EVENT_LENGTH = 72;
 
     // 拒绝原因
@@ -48,6 +48,10 @@ public final class Protocol {
     public static final int REJECT_UNKNOWN_ORDER = 4;
     public static final int REJECT_MALFORMED = 5;
     public static final int REJECT_OVERFLOW = 6;
+    /** 重复撤单：orderId=原订单号，price 字段=原撤销的剩余数量。 */
+    public static final int REJECT_DUPLICATE_CANCEL = 7;
+    /** 重复入金：counterOrderId=depositId，price 字段=原入金金额。 */
+    public static final int REJECT_DUPLICATE_DEPOSIT = 8;
 
     public static int encodeCommand(MutableDirectBuffer b, int o, int type, int aux, long account, long f1, long f2, long f3) {
         b.putInt(o, type);

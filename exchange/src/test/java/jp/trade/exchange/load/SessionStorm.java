@@ -102,7 +102,7 @@ public final class SessionStorm {
             for (int i = 0; i < clients.size(); i++) {
                 final AeronCluster c = clients.get(i);
                 final long account = 1_000_000 + i;
-                int len = encodeCommand(buf, 0, CMD_DEPOSIT, ASSET_QUOTE, account, 1_000_000_000L, 0, 0);
+                int len = encodeCommand(buf, 0, CMD_DEPOSIT, ASSET_QUOTE, account, 1_000_000_000L, 1, 0);
                 offered += offerWithRetry(c, buf, len) ? 1 : 0;
                 len = encodeCommand(buf, 0, CMD_PLACE, SIDE_BUY, account, 1, 100, 1);
                 if (offerWithRetry(c, buf, len)) {

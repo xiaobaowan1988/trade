@@ -22,7 +22,7 @@ final class EngineStream {
             final int kind = rnd.nextInt(10);
             final long acct = 1 + rnd.nextInt(8);
             if (kind == 0 || i < 16) {
-                encodeCommand(cmd, 0, CMD_DEPOSIT, 1 + rnd.nextInt(2), 1 + (i % 8), 1 + rnd.nextInt(50_000), 0, 0);
+                encodeCommand(cmd, 0, CMD_DEPOSIT, 1 + rnd.nextInt(2), 1 + (i % 8), 1 + rnd.nextInt(50_000), i + 1, 0);
             } else if (kind == 1) {
                 encodeCommand(cmd, 0, CMD_CANCEL, 0, acct, 1 + rnd.nextInt(Math.max(1, i / 3)), 0, 0);
             } else {

@@ -41,12 +41,36 @@ public final class ExchangeService implements ClusteredService {
     private volatile boolean loadedFromSnapshot;
     private volatile Cluster.Role role = Cluster.Role.FOLLOWER;
 
+    // ---- 事件发布缓冲背压策略（“可以慢，不能丢”）----
+    private long eventWaitNs = java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+    private long degradedNs = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+    private long degradedUntilNs;
+    private String eventChannel = EventBridge.CHANNEL;
+    private volatile long eventWaits;
+    private volatile long eventWaitedNanos;
+    private volatile long degradedEntries;
+
+    /** 背压时撮合线程最多等多久（期间 cluster.idle() 保持心跳）。超时才丢弃并计数，丢弃的事件由日志补回。 */
+    public ExchangeService eventWait(long waitNanos, long degradedNanos) {
+        this.eventWaitNs = waitNanos;
+        this.degradedNs = degradedNanos;
+        return this;
+    }
+
+    /** 事件 IPC 流的 channel（测试里用来缩小缓冲）。 */
+    public ExchangeService eventChannel(String channel) {
+        this.eventChannel = channel;
+        return this;
+    }
+
+    public String eventChannel() { return eventChannel; }
+
     private final jp.trade.exchange.core.EventHandler handler = this::onEngineEvent;
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
-        this.eventPublication = cluster.aeron().addPublication(EventBridge.CHANNEL, EventBridge.STREAM_ID);
+        this.eventPublication = cluster.aeron().addPublication(eventChannel, EventBridge.STREAM_ID);
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
             loadedFromSnapshot = true;
@@ -73,9 +97,12 @@ public final class ExchangeService implements ClusteredService {
             return; // 只有 leader 对外发布；follower 仅推进状态
         }
         encodeEvent(eventBuf, 0, type, aux, seq, ts, orderId, account, price, qty, counterOrderId, counterAccount);
-        // 撮合线程绝不自旋等待：真正的背压（BACK_PRESSURED）时丢弃并计数，缺口由下游序号检测、由日志重放补数。
-        // 但 ADMIN_ACTION（发布缓冲 term 轮转）是“立即重试即可”的瞬时状态，不是背压，必须重试，否则会平白丢事件。
-        if (offerRetryingAdminAction(eventPublication, eventView) < 0) {
+        // 先有界等待，再丢弃（设计 §0）：
+        //  - ADMIN_ACTION（缓冲轮转）立即重试；
+        //  - 真正背压：等下游消费，期间 cluster.idle() 保持服务心跳；
+        //  - 等满 eventWaitNs 仍不行（下游挂了）：丢弃并计数，进入降级窗口，窗口内不再逐条傻等，
+        //    否则下游挂掉时每条命令都会被拖住一个超时。丢弃的事件由下游发现缺口后从 Raft 日志补回。
+        if (!offerEvent()) {
             droppedEvents++;
         }
         if (currentSession != null) {
@@ -84,6 +111,31 @@ public final class ExchangeService implements ClusteredService {
                 egressDropped++;
             }
         }
+    }
+
+    private boolean offerEvent() {
+        long r = offerRetryingAdminAction(eventPublication, eventView);
+        if (r >= 0) {
+            return true;
+        }
+        final long now = System.nanoTime();
+        if (now < degradedUntilNs || eventWaitNs <= 0) {
+            return false; // 降级窗口内：不等待
+        }
+        final long start = now;
+        eventWaits++;
+        while (r < 0 && r != Publication.CLOSED && r != Publication.MAX_POSITION_EXCEEDED
+                && System.nanoTime() - start < eventWaitNs) {
+            cluster.idleStrategy().idle(); // 服务专用的 idle：持续检查时钟/终止并维持心跳
+            r = offerRetryingAdminAction(eventPublication, eventView);
+        }
+        eventWaitedNanos += System.nanoTime() - start;
+        if (r >= 0) {
+            return true;
+        }
+        degradedUntilNs = System.nanoTime() + degradedNs;
+        degradedEntries++;
+        return false;
     }
 
     interface Offerer {
@@ -150,6 +202,11 @@ public final class ExchangeService implements ClusteredService {
     public String stateHash() { return engine.stateHash(); }
 
     public long droppedEvents() { return droppedEvents; }
+
+    /** 撮合线程因事件发布背压而进入等待的次数 / 累计等待纳秒 / 因等待超时进入降级窗口的次数。 */
+    public long eventWaits() { return eventWaits; }
+    public long eventWaitedNanos() { return eventWaitedNanos; }
+    public long degradedEntries() { return degradedEntries; }
 
     /** 因 egress 背压而没能送达请求方的确认/回报条数。 */
     public long egressDropped() { return egressDropped; }

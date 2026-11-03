@@ -22,7 +22,9 @@ class MatchingEngineTest {
         return out;
     }
 
-    private List<Evt> deposit(MatchingEngine e, long acct, int asset, long amt) { return run(e, CMD_DEPOSIT, asset, acct, amt, 0, 0); }
+    private long nextDepositId = 1;
+    private List<Evt> deposit(MatchingEngine e, long acct, int asset, long amt) { return run(e, CMD_DEPOSIT, asset, acct, amt, nextDepositId++, 0); }
+    private List<Evt> depositWithId(MatchingEngine e, long acct, int asset, long amt, long id) { return run(e, CMD_DEPOSIT, asset, acct, amt, id, 0); }
     private List<Evt> place(MatchingEngine e, long acct, int side, long cid, long price, long qty) { return run(e, CMD_PLACE, side, acct, cid, price, qty); }
     private List<Evt> cancel(MatchingEngine e, long acct, long orderId) { return run(e, CMD_CANCEL, 0, acct, orderId, 0, 0); }
 
@@ -130,7 +132,7 @@ class MatchingEngineTest {
                 type = CMD_DEPOSIT;
                 aux = 1 + rnd.nextInt(2);
                 f1 = 1 + rnd.nextInt(50_000);
-                f2 = 0;
+                f2 = i + 1; // depositId：每笔入金唯一
                 f3 = 0;
                 if (aux == ASSET_BASE) depositedBase += f1; else depositedQuote += f1;
             } else if (kind == 1) {
@@ -167,5 +169,94 @@ class MatchingEngineTest {
         assertEquals(evA.subList(evA.size() - evR.size(), evA.size()), evR);
         assertTrue(evA.stream().anyMatch(x -> x.type == EVT_TRADE), "随机流应产生成交");
         assertTrue(evA.stream().anyMatch(x -> x.type == EVT_CANCELLED), "随机流应产生撤单");
+    }
+
+    // ---------- “可以慢，不能丢”：回报丢了，重试必须取回原结果 ----------
+
+    @Test
+    void retryOfAcceptedOrderReturnsTheOriginalOrderId() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 100_000);
+        final long orderId = place(e, 1, SIDE_BUY, 7, 100, 3).get(0).orderId;   // 首次：回报“丢了”
+        final List<Evt> retry = place(e, 1, SIDE_BUY, 7, 100, 3);
+        assertEquals(1, retry.size());
+        assertEquals(EVT_REJECTED, retry.get(0).type);
+        assertEquals(REJECT_DUPLICATE_CLIENT_ORDER, retry.get(0).qty);
+        assertEquals(orderId, retry.get(0).orderId, "返回原订单号");
+        assertEquals(0, retry.get(0).price, "原本是被接受的");
+        assertEquals(1, e.restingOrderCount(), "没有重复下单");
+        assertEquals(300, e.frozen(1, ASSET_QUOTE), "没有重复冻结");
+    }
+
+    @Test
+    void retryOfRejectedOrderReturnsTheOriginalReasonEvenIfFundsArriveLater() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 10);
+        assertEquals(REJECT_INSUFFICIENT_FUNDS, place(e, 1, SIDE_BUY, 7, 100, 3).get(0).qty);
+        deposit(e, 1, ASSET_QUOTE, 1_000_000);            // 之后资金到账
+        final List<Evt> retry = place(e, 1, SIDE_BUY, 7, 100, 3);
+        assertEquals(REJECT_DUPLICATE_CLIENT_ORDER, retry.get(0).qty);
+        assertEquals(0, retry.get(0).orderId, "原本就没有订单");
+        assertEquals(REJECT_INSUFFICIENT_FUNDS, retry.get(0).price, "返回原拒绝原因，而不是重新校验");
+        assertEquals(0, e.restingOrderCount());
+    }
+
+    @Test
+    void retryOfCancelReturnsTheOriginalResultAndDoesNotReleaseFundsTwice() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 10_000);
+        place(e, 1, SIDE_BUY, 1, 100, 10); // order 1
+        assertEquals(EVT_CANCELLED, cancel(e, 1, 1).get(0).type);
+        final long availableAfterFirst = e.available(1, ASSET_QUOTE);
+
+        final List<Evt> retry = cancel(e, 1, 1);
+        assertEquals(1, retry.size());
+        assertEquals(EVT_REJECTED, retry.get(0).type, "重复撤单不能再产生 CANCELLED 事件，否则投影会重复释放资金");
+        assertEquals(REJECT_DUPLICATE_CANCEL, retry.get(0).qty);
+        assertEquals(1, retry.get(0).orderId);
+        assertEquals(10, retry.get(0).price, "返回原撤销的剩余数量");
+        assertEquals(availableAfterFirst, e.available(1, ASSET_QUOTE));
+        // 别的账户撤不了它，也拿不到这个结果
+        assertEquals(REJECT_UNKNOWN_ORDER, cancel(e, 2, 1).get(0).qty);
+    }
+
+    @Test
+    void outcomesSurviveSnapshotRestore() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 10_000);
+        place(e, 1, SIDE_BUY, 1, 100, 10);
+        place(e, 1, SIDE_BUY, 2, 100, 100_000); // 资金不足，被拒
+        cancel(e, 1, 1);
+        final MatchingEngine r = MatchingEngine.fromSnapshot(e.snapshot());
+        assertEquals(e.stateHash(), r.stateHash());
+        assertEquals(REJECT_DUPLICATE_CLIENT_ORDER, place(r, 1, SIDE_BUY, 1, 100, 10).get(0).qty);
+        assertEquals(REJECT_INSUFFICIENT_FUNDS, place(r, 1, SIDE_BUY, 2, 100, 100_000).get(0).price);
+        assertEquals(REJECT_DUPLICATE_CANCEL, cancel(r, 1, 1).get(0).qty);
+    }
+
+    @Test
+    void retryOfDepositIsIdempotentSoMoneyIsNeverCreditedTwice() {
+        final MatchingEngine e = new MatchingEngine();
+        assertEquals(EVT_DEPOSITED, depositWithId(e, 1, ASSET_QUOTE, 5_000, 77).get(0).type);   // 首次：回报“丢了”
+        final List<Evt> retry = depositWithId(e, 1, ASSET_QUOTE, 5_000, 77);                    // 超时重试
+        assertEquals(1, retry.size());
+        assertEquals(EVT_REJECTED, retry.get(0).type, "重试不能再产生 DEPOSITED 事件，否则投影会再入账一次");
+        assertEquals(REJECT_DUPLICATE_DEPOSIT, retry.get(0).qty);
+        assertEquals(5_000, retry.get(0).price, "返回原入金金额");
+        assertEquals(77, retry.get(0).cOrder);
+        assertEquals(5_000, e.available(1, ASSET_QUOTE), "只入账一次");
+        assertEquals(5_000, e.totalHeld(ASSET_QUOTE));
+
+        // 同一个 depositId 在不同账户互不影响；不同 depositId 是新的入金
+        assertEquals(EVT_DEPOSITED, depositWithId(e, 2, ASSET_QUOTE, 100, 77).get(0).type);
+        assertEquals(EVT_DEPOSITED, depositWithId(e, 1, ASSET_QUOTE, 5_000, 78).get(0).type);
+        assertEquals(10_000, e.available(1, ASSET_QUOTE));
+    }
+
+    @Test
+    void depositWithoutAnIdempotencyKeyIsRejected() {
+        final MatchingEngine e = new MatchingEngine();
+        assertEquals(REJECT_INVALID, depositWithId(e, 1, ASSET_QUOTE, 5_000, 0).get(0).qty);
+        assertEquals(0, e.totalHeld(ASSET_QUOTE), "没有幂等键的入金不被接受");
     }
 }

@@ -105,6 +105,7 @@ class FailoverTest {
             assertTrue(t == EVT_ACCEPTED || t == EVT_REJECTED, "ACCEPTED，或因首次已生效而被去重拒绝");
             if (t == EVT_REJECTED) {
                 assertEquals(REJECT_DUPLICATE_CLIENT_ORDER, qty(r.get(0)));
+                assertTrue(eventOrderId(new UnsafeBuffer(r.get(0)), 0) > 0, "重试拿到的是原订单号，丢了回报也不丢结果");
             }
 
             // 撤销宕机前挂的 order 1：证明已提交的状态没丢

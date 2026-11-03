@@ -53,11 +53,19 @@ public final class ExchangeNode implements AutoCloseable {
     /** @param customizer 在启动前调整 Aeron 配置（测试里用来缩小日志/归档分段） */
     public static ExchangeNode start(int memberId, int memberCount, File baseDir, boolean fresh, EventSink sink,
                                      java.util.function.Consumer<ClusterConfig> customizer) {
+        return start(memberId, memberCount, baseDir, fresh, sink, customizer, svc -> {});
+    }
+
+    /** @param serviceCustomizer 在启动前调整撮合服务（事件发布缓冲的等待策略等） */
+    public static ExchangeNode start(int memberId, int memberCount, File baseDir, boolean fresh, EventSink sink,
+                                     java.util.function.Consumer<ClusterConfig> customizer,
+                                     java.util.function.Consumer<ExchangeService> serviceCustomizer) {
         if (fresh) {
             IoUtil.delete(baseDir, true);
         }
         baseDir.mkdirs();
         final ExchangeService service = new ExchangeService();
+        serviceCustomizer.accept(service);
         final ClusterConfig config = ClusterConfig.create(memberId, hostnames(memberCount), PORT_BASE, service);
         config.baseDir(baseDir);
         config.aeronDirectoryName(new File(baseDir, "aeron").getAbsolutePath()); // 放磁盘而非 /dev/shm，容器内更稳
@@ -69,6 +77,8 @@ public final class ExchangeNode implements AutoCloseable {
                 .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)) // 默认 10s，缩短以加快故障切换
                 // Aeron 默认只允许 10 个并发会话；用户经网关复用进集群，所以这里按“网关数 + 运维连接”配置
                 .maxConcurrentSessions(1_000);
+        // 先持久、再确认：Aeron 默认 fileSyncLevel=0 只写页缓存，整机断电会丢“已确认”的订单。2=fsync 数据与元数据。
+        config.archiveContext().fileSyncLevel(2).catalogFileSyncLevel(2);
         config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
 
         customizer.accept(config);

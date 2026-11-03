@@ -90,7 +90,7 @@ final class Gateway implements Runnable, EgressListener {
             case EVT_REJECTED -> {
                 final long reason = eventQty(b, offset);
                 rejectsByReason[(int) Math.min(reason, 7)]++;
-                if (eventOrderId(b, offset) == 0) { // 下单被拒（撤单被拒时 orderId 非 0）
+                if (reason != REJECT_UNKNOWN_ORDER && reason != REJECT_DUPLICATE_CANCEL) { // 这两种原因只会来自撤单；其余是下单被拒
                     rejectedPlaces++;
                     if (!record(account, eventCounterOrderId(b, offset))) {
                         late();
@@ -161,7 +161,7 @@ final class Gateway implements Runnable, EgressListener {
     private void pumpDeposits() {
         for (int i = 0; i < 64 && !depositQueue.isEmpty() && depositsSent - deposited < 500; i++) {
             final long[] d = depositQueue.peekFirst();
-            final int len = encodeCommand(buf, 0, CMD_DEPOSIT, (int) d[1], d[0], d[2], 0, 0);
+            final int len = encodeCommand(buf, 0, CMD_DEPOSIT, (int) d[1], d[0], d[2], d[1], 0); // depositId=资产号，每账户每资产一笔
             if (cluster.offer(buf, 0, len) < 0) {
                 backPressure++;
                 return;

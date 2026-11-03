@@ -10,7 +10,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.TreeSet;
 import org.agrona.DirectBuffer;
 
 /**
@@ -59,7 +58,15 @@ public final class MatchingEngine {
     private final TreeMap<Long, ArrayDeque<Order>> bids = new TreeMap<>(Comparator.reverseOrder());
     private final TreeMap<Long, ArrayDeque<Order>> asks = new TreeMap<>();
     private final Map<Long, Order> ordersById = new HashMap<>(); // 仅点查
-    private final TreeSet<ClientKey> seenClientOrders = new TreeSet<>();
+    /**
+     * 每个 (账户, clientOrderId) 的结果：>0 是接受后的订单号，<0 是被拒原因的负数。
+     * 重试同一 clientOrderId 时据此返回原结果，客户端丢了回报也能取回（设计 §1）。
+     */
+    private final TreeMap<ClientKey, Long> placeOutcomes = new TreeMap<>();
+    /** 已撤销订单的结果：key=(账户, 订单号)，value=撤销时的剩余数量。重复撤单据此返回原结果。 */
+    private final TreeMap<ClientKey, Long> cancelOutcomes = new TreeMap<>();
+    /** 已入账的入金：key=(账户, depositId)，value=金额。重试同一笔入金时返回原结果，绝不重复入账。 */
+    private final TreeMap<ClientKey, Long> depositOutcomes = new TreeMap<>();
     private long nextOrderId = 1;
     private long nextEventSeq = 1;
 
@@ -81,16 +88,23 @@ public final class MatchingEngine {
         final long f2 = buf.getLong(offset + 24);
         final long f3 = buf.getLong(offset + 32);
         switch (type) {
-            case CMD_DEPOSIT -> deposit(account, aux, f1);
+            case CMD_DEPOSIT -> deposit(account, aux, f1, f2);
             case CMD_PLACE -> place(account, aux, f1, f2, f3);
             case CMD_CANCEL -> cancel(account, f1);
             default -> emit(EVT_REJECTED, 0, 0, account, 0, REJECT_MALFORMED, 0, 0);
         }
     }
 
-    private void deposit(long accountId, int asset, long amount) {
-        if (amount <= 0 || (asset != ASSET_BASE && asset != ASSET_QUOTE)) {
-            emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_INVALID, 0, 0);
+    private void deposit(long accountId, int asset, long amount, long depositId) {
+        if (amount <= 0 || depositId <= 0 || (asset != ASSET_BASE && asset != ASSET_QUOTE)) {
+            emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_INVALID, depositId, 0);
+            return;
+        }
+        final ClientKey key = new ClientKey(accountId, depositId);
+        final Long prior = depositOutcomes.get(key);
+        if (prior != null) {
+            // 重试：返回原结果，不再入账；这是 REJECTED 事件，投影无状态变化
+            emit(EVT_REJECTED, 0, 0, accountId, prior, REJECT_DUPLICATE_DEPOSIT, depositId, 0);
             return;
         }
         final Account a = accounts.computeIfAbsent(accountId, k -> new Account());
@@ -100,7 +114,8 @@ public final class MatchingEngine {
             emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_OVERFLOW, 0, 0);
             return;
         }
-        emit(EVT_DEPOSITED, 0, 0, accountId, asset, amount, 0, 0);
+        depositOutcomes.put(key, amount);
+        emit(EVT_DEPOSITED, 0, 0, accountId, asset, amount, depositId, 0);
     }
 
     private void place(long accountId, int side, long clientOrderId, long price, long qty) {
@@ -108,8 +123,12 @@ public final class MatchingEngine {
             emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_INVALID, clientOrderId, 0);
             return;
         }
-        if (!seenClientOrders.add(new ClientKey(accountId, clientOrderId))) {
-            emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_DUPLICATE_CLIENT_ORDER, clientOrderId, 0);
+        final ClientKey key = new ClientKey(accountId, clientOrderId);
+        final Long prior = placeOutcomes.get(key);
+        if (prior != null) {
+            // 重试：返回原结果。orderId=原订单号（原本被拒则 0），price=原拒绝原因（原本被接受则 0）
+            emit(EVT_REJECTED, 0, prior > 0 ? prior : 0, accountId, prior < 0 ? -prior : 0,
+                    REJECT_DUPLICATE_CLIENT_ORDER, clientOrderId, 0);
             return;
         }
         final Account acct = accounts.get(accountId);
@@ -118,10 +137,12 @@ public final class MatchingEngine {
         try {
             freezeAmount = side == SIDE_BUY ? Math.multiplyExact(price, qty) : qty;
         } catch (ArithmeticException e) {
+            placeOutcomes.put(key, (long) -REJECT_OVERFLOW);
             emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_OVERFLOW, clientOrderId, 0);
             return;
         }
         if (acct == null || acct.available[freezeAsset] < freezeAmount) {
+            placeOutcomes.put(key, (long) -REJECT_INSUFFICIENT_FUNDS);
             emit(EVT_REJECTED, 0, 0, accountId, 0, REJECT_INSUFFICIENT_FUNDS, clientOrderId, 0);
             return;
         }
@@ -130,6 +151,7 @@ public final class MatchingEngine {
         acct.frozen[freezeAsset] += freezeAmount;
 
         final Order taker = new Order(nextOrderId++, accountId, side, price, qty);
+        placeOutcomes.put(key, taker.id);
         emit(EVT_ACCEPTED, side, taker.id, accountId, price, qty, clientOrderId, 0);
 
         match(taker);
@@ -188,6 +210,12 @@ public final class MatchingEngine {
     private void cancel(long accountId, long orderId) {
         final Order o = ordersById.get(orderId);
         if (o == null || o.account != accountId) {
+            final Long cancelledRemaining = cancelOutcomes.get(new ClientKey(accountId, orderId));
+            if (cancelledRemaining != null) {
+                // 重复撤单：返回原结果（REJECTED 事件，投影无状态变化，不会重复释放资金）
+                emit(EVT_REJECTED, 0, orderId, accountId, cancelledRemaining, REJECT_DUPLICATE_CANCEL, orderId, 0);
+                return;
+            }
             emit(EVT_REJECTED, 0, orderId, accountId, 0, REJECT_UNKNOWN_ORDER, orderId, 0);
             return;
         }
@@ -198,6 +226,7 @@ public final class MatchingEngine {
             bk.remove(o.price);
         }
         ordersById.remove(orderId);
+        cancelOutcomes.put(new ClientKey(accountId, orderId), o.remaining);
         final Account a = accounts.get(accountId);
         if (o.side == SIDE_BUY) {
             final long amt = o.price * o.remaining;
@@ -278,7 +307,7 @@ public final class MatchingEngine {
     public byte[] snapshot() {
         int orderCount = ordersById.size();
         final ByteBuffer bb = ByteBuffer.allocate(
-                8 * 2 + 4 + accounts.size() * (8 + 8 * 4) + 4 + orderCount * (8 * 4 + 4) + 4 + seenClientOrders.size() * 16)
+                8 * 2 + 4 + accounts.size() * (8 + 8 * 4) + 4 + orderCount * (8 * 4 + 4) + 4 + placeOutcomes.size() * 24 + 4 + cancelOutcomes.size() * 24 + 4 + depositOutcomes.size() * 24)
                 .order(ByteOrder.LITTLE_ENDIAN);
         bb.putLong(nextOrderId);
         bb.putLong(nextEventSeq);
@@ -297,9 +326,17 @@ public final class MatchingEngine {
                 }
             }
         }
-        bb.putInt(seenClientOrders.size());
-        for (ClientKey k : seenClientOrders) {
-            bb.putLong(k.account).putLong(k.clientOrderId);
+        bb.putInt(placeOutcomes.size());
+        for (Map.Entry<ClientKey, Long> e : placeOutcomes.entrySet()) {
+            bb.putLong(e.getKey().account).putLong(e.getKey().clientOrderId).putLong(e.getValue());
+        }
+        bb.putInt(cancelOutcomes.size());
+        for (Map.Entry<ClientKey, Long> e : cancelOutcomes.entrySet()) {
+            bb.putLong(e.getKey().account).putLong(e.getKey().clientOrderId).putLong(e.getValue());
+        }
+        bb.putInt(depositOutcomes.size());
+        for (Map.Entry<ClientKey, Long> e : depositOutcomes.entrySet()) {
+            bb.putLong(e.getKey().account).putLong(e.getKey().clientOrderId).putLong(e.getValue());
         }
         return bb.array();
     }
@@ -332,7 +369,15 @@ public final class MatchingEngine {
         }
         n = bb.getInt();
         for (int i = 0; i < n; i++) {
-            e.seenClientOrders.add(new ClientKey(bb.getLong(), bb.getLong()));
+            e.placeOutcomes.put(new ClientKey(bb.getLong(), bb.getLong()), bb.getLong());
+        }
+        n = bb.getInt();
+        for (int i = 0; i < n; i++) {
+            e.cancelOutcomes.put(new ClientKey(bb.getLong(), bb.getLong()), bb.getLong());
+        }
+        n = bb.getInt();
+        for (int i = 0; i < n; i++) {
+            e.depositOutcomes.put(new ClientKey(bb.getLong(), bb.getLong()), bb.getLong());
         }
         return e;
     }

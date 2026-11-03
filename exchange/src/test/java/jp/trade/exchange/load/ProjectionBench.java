@@ -33,9 +33,9 @@ public final class ProjectionBench {
         });
         int step = 0;
         for (int a = 1; a <= accounts; a++) {
-            encodeCommand(cmd, 0, CMD_DEPOSIT, ASSET_QUOTE, a, 10_000_000_000_000L, 0, 0);
+            encodeCommand(cmd, 0, CMD_DEPOSIT, ASSET_QUOTE, a, 10_000_000_000_000L, 2L * a, 0);
             run.accept(step++);
-            encodeCommand(cmd, 0, CMD_DEPOSIT, ASSET_BASE, a, 1_000_000_000L, 0, 0);
+            encodeCommand(cmd, 0, CMD_DEPOSIT, ASSET_BASE, a, 1_000_000_000L, 2L * a + 1, 0);
             run.accept(step++);
         }
         final int cids[] = new int[accounts + 1];
