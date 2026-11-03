@@ -1,0 +1,171 @@
+package jp.trade.exchange;
+
+import static jp.trade.exchange.core.Protocol.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import jp.trade.exchange.core.MatchingEngine;
+import org.agrona.ExpandableArrayBuffer;
+import org.junit.jupiter.api.Test;
+
+class MatchingEngineTest {
+    record Evt(int type, int aux, long seq, long ts, long orderId, long account, long price, long qty, long cOrder, long cAcct) {}
+
+    private final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(COMMAND_LENGTH);
+
+    private List<Evt> run(MatchingEngine e, int type, int aux, long acct, long f1, long f2, long f3) {
+        final List<Evt> out = new ArrayList<>();
+        encodeCommand(buf, 0, type, aux, acct, f1, f2, f3);
+        e.onCommand(buf, 0, COMMAND_LENGTH, 1_000, (t, a, s, ts, o, ac, p, q, co, ca) -> out.add(new Evt(t, a, s, ts, o, ac, p, q, co, ca)));
+        return out;
+    }
+
+    private List<Evt> deposit(MatchingEngine e, long acct, int asset, long amt) { return run(e, CMD_DEPOSIT, asset, acct, amt, 0, 0); }
+    private List<Evt> place(MatchingEngine e, long acct, int side, long cid, long price, long qty) { return run(e, CMD_PLACE, side, acct, cid, price, qty); }
+    private List<Evt> cancel(MatchingEngine e, long acct, long orderId) { return run(e, CMD_CANCEL, 0, acct, orderId, 0, 0); }
+
+    @Test
+    void pricePriorityThenTimePriority() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_BASE, 100);
+        deposit(e, 2, ASSET_BASE, 100);
+        deposit(e, 3, ASSET_QUOTE, 1_000_000);
+        place(e, 1, SIDE_SELL, 1, 5000, 5);  // order 1：先到
+        place(e, 2, SIDE_SELL, 1, 5000, 5);  // order 2：同价后到
+        place(e, 1, SIDE_SELL, 2, 4900, 5);  // order 3：更优价
+        final List<Evt> ev = place(e, 3, SIDE_BUY, 1, 5000, 12);
+        final List<Evt> trades = ev.stream().filter(x -> x.type == EVT_TRADE).toList();
+        assertEquals(3, trades.size());
+        assertEquals(3, trades.get(0).cOrder);  // 最优价先成交
+        assertEquals(4900, trades.get(0).price);
+        assertEquals(1, trades.get(1).cOrder);  // 同价：先到先成交
+        assertEquals(2, trades.get(2).cOrder);
+        assertEquals(2, trades.get(2).qty);     // 12 = 5 + 5 + 2
+        assertEquals(1, e.restingOrderCount()); // order 2 剩 3
+    }
+
+    @Test
+    void tradesAtMakerPriceAndRefundsPriceImprovement() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_BASE, 10);
+        deposit(e, 2, ASSET_QUOTE, 100_000);
+        place(e, 1, SIDE_SELL, 1, 5000, 10);
+        place(e, 2, SIDE_BUY, 1, 5100, 10);
+        assertEquals(100_000 - 50_000, e.available(2, ASSET_QUOTE)); // 以 5000 成交，多冻结的 1000 已退回
+        assertEquals(0, e.frozen(2, ASSET_QUOTE));
+        assertEquals(10, e.available(2, ASSET_BASE));
+        assertEquals(50_000, e.available(1, ASSET_QUOTE));
+        assertEquals(0, e.frozen(1, ASSET_BASE));
+    }
+
+    @Test
+    void rejectsInsufficientFundsAndFreezesBeforeMatching() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 1_000);
+        final List<Evt> ev = place(e, 1, SIDE_BUY, 1, 5000, 1); // 需要 5000
+        assertEquals(EVT_REJECTED, ev.get(0).type);
+        assertEquals(REJECT_INSUFFICIENT_FUNDS, ev.get(0).qty);
+        // 挂单后可用余额被冻结，不能重复使用
+        deposit(e, 2, ASSET_QUOTE, 5_000);
+        place(e, 2, SIDE_BUY, 1, 5000, 1);
+        assertEquals(0, e.available(2, ASSET_QUOTE));
+        assertEquals(EVT_REJECTED, place(e, 2, SIDE_BUY, 2, 1, 1).get(0).type);
+    }
+
+    @Test
+    void duplicateClientOrderIdIsIdempotent() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 100_000);
+        assertEquals(EVT_ACCEPTED, place(e, 1, SIDE_BUY, 7, 100, 1).get(0).type);
+        final List<Evt> dup = place(e, 1, SIDE_BUY, 7, 100, 1);
+        assertEquals(EVT_REJECTED, dup.get(0).type);
+        assertEquals(REJECT_DUPLICATE_CLIENT_ORDER, dup.get(0).qty);
+        assertEquals(1, e.restingOrderCount());
+        assertEquals(100, e.frozen(1, ASSET_QUOTE));
+    }
+
+    @Test
+    void cancelReleasesFundsAndChecksOwner() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 10_000);
+        place(e, 1, SIDE_BUY, 1, 100, 10); // order 1
+        assertEquals(EVT_REJECTED, cancel(e, 2, 1).get(0).type); // 非所有者
+        assertEquals(EVT_CANCELLED, cancel(e, 1, 1).get(0).type);
+        assertEquals(10_000, e.available(1, ASSET_QUOTE));
+        assertEquals(0, e.frozen(1, ASSET_QUOTE));
+        assertEquals(EVT_REJECTED, cancel(e, 1, 1).get(0).type); // 已撤销
+    }
+
+    @Test
+    void overflowIsRejectedNotWrapped() {
+        final MatchingEngine e = new MatchingEngine();
+        deposit(e, 1, ASSET_QUOTE, 1_000);
+        final List<Evt> ev = place(e, 1, SIDE_BUY, 1, Long.MAX_VALUE, 2);
+        assertEquals(REJECT_OVERFLOW, ev.get(0).qty);
+    }
+
+    /** 随机命令流：资产守恒 + 两个引擎重放结果完全一致（确定性）+ 快照恢复后继续一致。 */
+    @Test
+    void conservationDeterminismAndSnapshotRoundTrip() {
+        final long seed = 42;
+        final MatchingEngine a = new MatchingEngine();
+        final MatchingEngine b = new MatchingEngine();
+        MatchingEngine restored = null;
+        final List<Evt> evA = new ArrayList<>();
+        final List<Evt> evB = new ArrayList<>();
+        final List<Evt> evR = new ArrayList<>();
+        long depositedBase = 0, depositedQuote = 0;
+
+        final Random rnd = new Random(seed);
+        final int steps = 20_000;
+        for (int i = 0; i < steps; i++) {
+            final int kind = rnd.nextInt(10);
+            final long acct = 1 + rnd.nextInt(8);
+            final int type;
+            final int aux;
+            final long f1, f2, f3;
+            if (kind == 0) {
+                type = CMD_DEPOSIT;
+                aux = 1 + rnd.nextInt(2);
+                f1 = 1 + rnd.nextInt(50_000);
+                f2 = 0;
+                f3 = 0;
+                if (aux == ASSET_BASE) depositedBase += f1; else depositedQuote += f1;
+            } else if (kind == 1) {
+                type = CMD_CANCEL;
+                aux = 0;
+                f1 = 1 + rnd.nextInt(Math.max(1, i / 3));
+                f2 = 0;
+                f3 = 0;
+            } else {
+                type = CMD_PLACE;
+                aux = rnd.nextInt(2);
+                f1 = i;
+                f2 = 95 + rnd.nextInt(11);
+                f3 = 1 + rnd.nextInt(20);
+            }
+            encodeCommand(buf, 0, type, aux, acct, f1, f2, f3);
+            final boolean isDeposit = type == CMD_DEPOSIT;
+            // 同时记录“被拒绝的存款”不应计入守恒：存款额都小于溢出界，必然成功
+            a.onCommand(buf, 0, COMMAND_LENGTH, i, (t, x, s, ts, o, ac, p, q, co, ca) -> evA.add(new Evt(t, x, s, ts, o, ac, p, q, co, ca)));
+            b.onCommand(buf, 0, COMMAND_LENGTH, i, (t, x, s, ts, o, ac, p, q, co, ca) -> evB.add(new Evt(t, x, s, ts, o, ac, p, q, co, ca)));
+            if (restored != null) {
+                restored.onCommand(buf, 0, COMMAND_LENGTH, i, (t, x, s, ts, o, ac, p, q, co, ca) -> evR.add(new Evt(t, x, s, ts, o, ac, p, q, co, ca)));
+            }
+            if (i == steps / 2) {
+                restored = MatchingEngine.fromSnapshot(a.snapshot()); // 中途做快照并恢复
+                assertEquals(a.stateHash(), restored.stateHash());
+            }
+            assertEquals(depositedBase, a.totalHeld(ASSET_BASE), "base 守恒 @" + i);
+            assertEquals(depositedQuote, a.totalHeld(ASSET_QUOTE), "quote 守恒 @" + i);
+        }
+        assertEquals(evA, evB);
+        assertEquals(a.stateHash(), b.stateHash());
+        assertEquals(a.stateHash(), restored.stateHash());      // 快照恢复后行为与原引擎一致
+        assertEquals(evA.subList(evA.size() - evR.size(), evA.size()), evR);
+        assertTrue(evA.stream().anyMatch(x -> x.type == EVT_TRADE), "随机流应产生成交");
+        assertTrue(evA.stream().anyMatch(x -> x.type == EVT_CANCELLED), "随机流应产生撤单");
+    }
+}
