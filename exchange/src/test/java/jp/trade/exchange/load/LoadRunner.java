@@ -30,6 +30,9 @@ import org.agrona.concurrent.UnsafeBuffer;
  * 参数（-D）：users=10000 gateways=3 pacedRate=5000 pacedSeconds=15 saturationOps=100000 window=2000 project=true
  */
 public final class LoadRunner {
+    /** 停滞时打印的诊断信息（由调用方设置）。 */
+    static volatile java.util.function.Supplier<String> diag;
+
     static final long QUOTE_DEPOSIT = 10_000_000_000_000L;
     static final long BASE_DEPOSIT = 1_000_000_000L;
 
@@ -136,10 +139,14 @@ public final class LoadRunner {
             }
             Thread.sleep(50);
         }
-        for (Gateway g : gws) {
+        for (Gateway g : gws.subList(0, Math.min(3, gws.size()))) {
             System.out.printf("   gateway %d: 已发 %d 笔入金，已确认 %d，背压 %d%n", g.id, g.depositsSent, g.deposited, g.backPressure);
         }
-        System.out.printf("   服务端 egress 因背压丢弃=%d，事件发布丢弃=%d%n", node.service().egressDropped(), node.service().droppedEvents());
+        System.out.printf("   （共 %d 个网关，总已确认 %d；客户端认为会话已关闭的 %d 个）%n", gws.size(), gws.stream().mapToLong(g -> g.deposited).sum(),
+                gws.stream().filter(Gateway::clusterClosed).count());
+        System.out.printf("   服务端会话：打开 %d，关闭 %d，关闭原因 %s%n", node.service().sessionsOpened(), node.service().sessionsClosed(), node.service().closeReasons());
+        System.out.printf("   服务端 egress 因背压丢弃=%d，事件发布丢弃=%d，已应用命令数=%d，已发出入金总数=%d%n", node.service().egressDropped(), node.service().droppedEvents(),
+                node.service().commandsApplied(), gws.stream().mapToLong(g -> g.depositsSent).sum());
         throw new IllegalStateException("deposits not acknowledged in time");
     }
 
@@ -157,6 +164,10 @@ public final class LoadRunner {
         }
         final long deadline = System.currentTimeMillis() + timeoutSec * 1000;
         long lastPrint = 0;
+        long lastAcked = -1;
+        long lastProgressAt = System.currentTimeMillis();
+        long lastDiag = 0;
+        long lastTrace = 0;
         while (true) {
             boolean all = true;
             long acked = 0;
@@ -170,6 +181,22 @@ public final class LoadRunner {
             if (System.currentTimeMillis() > deadline) {
                 System.out.println("!! 阶段超时，部分请求未得到回报");
                 break;
+            }
+            if (System.currentTimeMillis() - lastProgressAt > 45_000) {
+                System.out.println("!! 连续 45 秒没有任何进展，放弃等待（请求没有得到回报，也不会再有）");
+                break;
+            }
+            if (acked != lastAcked) {
+                lastAcked = acked;
+                lastProgressAt = System.currentTimeMillis();
+            } else if (diag != null && System.currentTimeMillis() - lastProgressAt > 10_000 && System.currentTimeMillis() - lastDiag > 10_000) {
+                lastDiag = System.currentTimeMillis();
+                System.out.println("   !! 已 " + (System.currentTimeMillis() - lastProgressAt) / 1000 + " 秒没有任何进展。服务端: " + diag.get()
+                        + "；客户端认为已关闭的会话 " + gws.stream().filter(Gateway::clusterClosed).count() + " / " + gws.size());
+            }
+            if (diag != null && Boolean.getBoolean("diag.trace") && System.currentTimeMillis() - lastTrace > 2_000) {
+                lastTrace = System.currentTimeMillis();
+                System.out.printf("   [t+%4.1fs] acked=%d | %s%n", (System.nanoTime() - t0) / 1e9, acked, diag.get());
             }
             if (System.currentTimeMillis() - lastPrint > 5_000) {
                 lastPrint = System.currentTimeMillis();

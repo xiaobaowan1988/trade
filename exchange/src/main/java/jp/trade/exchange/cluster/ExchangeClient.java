@@ -8,6 +8,7 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.samples.cluster.ClusterConfig;
 import java.util.ArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.List;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -26,7 +27,17 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
 
     /** 连接单成员集群，复用该节点的 MediaDriver。 */
     public ExchangeClient(String aeronDir) {
-        this(aeronDir, 1, null);
+        this(aeronDir, 1, null, DEFAULT_CONNECT_TIMEOUT_MS);
+    }
+
+    /**
+     * 连接超时必须大于驱动的发布连接超时（节点默认 60 秒）：首次连接没成功的发布端要等满那么久才会重试，
+     * 客户端若只等 5 秒就会在重试发生之前放弃。需要“连不上就快速失败”的场景（例如测试）可以传一个较短的值。
+     */
+    public static final long DEFAULT_CONNECT_TIMEOUT_MS = 90_000;
+
+    public ExchangeClient(String aeronDir, long connectTimeoutMs) {
+        this(aeronDir, 1, null, connectTimeoutMs);
     }
 
     /** 连接 memberCount 成员集群，客户端自带独立 MediaDriver，不依赖任何一个集群节点存活。 */
@@ -34,18 +45,38 @@ public final class ExchangeClient implements AutoCloseable, EgressListener {
         final MediaDriver d = MediaDriver.launch(new MediaDriver.Context()
                 .threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true)
                 .aeronDirectoryName(CommonContext.getAeronDirectoryName() + "-client-" + System.nanoTime()));
-        return new ExchangeClient(d.aeronDirectoryName(), memberCount, d);
+        return new ExchangeClient(d.aeronDirectoryName(), memberCount, d, DEFAULT_CONNECT_TIMEOUT_MS);
     }
 
-    private ExchangeClient(String aeronDir, int memberCount, MediaDriver ownedDriver) {
+    private ExchangeClient(String aeronDir, int memberCount, MediaDriver ownedDriver, long connectTimeoutMs) {
         this.ownedDriver = ownedDriver;
-        this.cluster = AeronCluster.connect(new AeronCluster.Context()
-                .aeronDirectoryName(aeronDir)
-                .egressListener(this)
-                .ingressChannel("aeron:udp?term-length=64k")
-                .ingressEndpoints(ClusterConfig.ingressEndpoints(
-                        ExchangeNode.hostnames(memberCount), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
-                .egressChannel("aeron:udp?endpoint=localhost:0"));
+        this.cluster = connectWithRetry(aeronDir, memberCount, connectTimeoutMs);
+    }
+
+    /**
+     * 连接失败就换一个全新的发布端重试，直到总期限。不依赖驱动里“发布连接超时”去触发内部重试：
+     * 节点刚启动、或刚经历 leader 切换时，第一次尝试失败很常见，而节点默认把发布连接超时放宽到了 60 秒。
+     * 每次尝试只等一小段时间（默认 5 秒；总期限比它短时用总期限）。
+     */
+    private AeronCluster connectWithRetry(String aeronDir, int memberCount, long totalMs) {
+        final long deadline = System.currentTimeMillis() + totalMs;
+        final long attemptMs = Math.min(5_000, totalMs);
+        RuntimeException last = null;
+        do {
+            try {
+                return AeronCluster.connect(new AeronCluster.Context()
+                        .aeronDirectoryName(aeronDir)
+                        .messageTimeoutNs(TimeUnit.MILLISECONDS.toNanos(attemptMs))
+                        .egressListener(this)
+                        .ingressChannel("aeron:udp?term-length=64k")
+                        .ingressEndpoints(ClusterConfig.ingressEndpoints(
+                                ExchangeNode.hostnames(memberCount), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
+                        .egressChannel("aeron:udp?endpoint=localhost:0"));
+            } catch (io.aeron.exceptions.TimeoutException e) {
+                last = e;
+            }
+        } while (System.currentTimeMillis() < deadline);
+        throw last;
     }
 
     @Override

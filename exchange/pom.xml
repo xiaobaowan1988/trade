@@ -69,7 +69,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.2</version>
         <configuration>
-          <argLine>${jvm.args}</argLine>
+          <argLine>${jvm.args} -Dexchange.threading=shared -Dexchange.publicationConnectionSec=5 -Dexchange.imageLivenessSec=10 -Dexchange.sessionTimeoutSec=10 -Djava.io.tmpdir=${project.build.directory}/test-tmp</argLine>
         </configuration>
       </plugin>
       <plugin>
@@ -79,6 +79,22 @@
         <configuration>
           <executable>java</executable>
         </configuration>
+        <executions>
+          <!-- 测试的临时数据（每个节点的 64MB 稀疏日志、归档、MinIO 数据……）放在 target/test-tmp，
+               每次构建开始时清掉，避免像以前那样在共享的 /tmp 里累积到几十 GB 把磁盘写满 -->
+          <execution>
+            <id>reset-test-tmp</id>
+            <phase>initialize</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>sh</executable>
+              <arguments>
+                <argument>-c</argument>
+                <argument>rm -rf "${project.build.directory}/test-tmp" &amp;&amp; mkdir -p "${project.build.directory}/test-tmp"</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

@@ -78,7 +78,25 @@ public final class CorrectnessRunner {
         final List<byte[]> tap = Collections.synchronizedList(new ArrayList<>((int) (ops * 11 / 10) + 100_000));
         final File dir = Files.createTempDirectory("exch-correct").toFile();
         final ExchangeNode node = ExchangeNode.start(0, 1, dir, true, sink, cfg -> {
-            cfg.consensusModuleContext().maxConcurrentSessions(1_000);
+            cfg.consensusModuleContext().maxConcurrentSessions(Integer.getInteger("maxSessions", 512));
+            if (System.getProperty("driver") != null) { // 不指定则沿用节点默认（专用线程）
+                cfg.mediaDriverContext().threadingMode("dedicated".equals(System.getProperty("driver"))
+                        ? io.aeron.driver.ThreadingMode.DEDICATED : io.aeron.driver.ThreadingMode.SHARED);
+            }
+            if (System.getProperty("archive") != null) {
+                cfg.archiveContext().threadingMode("dedicated".equals(System.getProperty("archive"))
+                        ? io.aeron.archive.ArchiveThreadingMode.DEDICATED : io.aeron.archive.ArchiveThreadingMode.SHARED);
+            }
+            if (Long.getLong("imageLivenessSec") != null) {
+                cfg.mediaDriverContext().imageLivenessTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("imageLivenessSec")));
+            }
+            if (Long.getLong("pubConnSec") != null) {
+                cfg.mediaDriverContext().publicationConnectionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("pubConnSec")));
+            }
+            final Long sessionTimeoutSec = Long.getLong("sessionTimeoutSec");
+            if (sessionTimeoutSec != null) {
+                cfg.consensusModuleContext().sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(sessionTimeoutSec));
+            }
             cfg.errorHandler(t -> {
                 if (nodeErrors.incrementAndGet() <= 5) {
                     t.printStackTrace();
@@ -95,20 +113,58 @@ public final class CorrectnessRunner {
         MatchingEngine truth;
         String liveHash;
         long head;
+        LoadRunner.diag = () -> String.format("已应用命令 %d，会话 打开 %d/关闭 %d %s，egress丢弃 %d，事件丢弃 %d，等待次数 %d",
+                node.service().commandsApplied(), node.service().sessionsOpened(), node.service().sessionsClosed(),
+                node.service().closeReasons(), node.service().egressDropped(), node.service().droppedEvents(), node.service().eventWaits());
+        io.aeron.Aeron sharedAeron = null;
         try {
+            if (Boolean.parseBoolean(System.getProperty("shared", "true"))) {
+                sharedAeron = io.aeron.Aeron.connect(new io.aeron.Aeron.Context().aeronDirectoryName(node.aeronDirectoryName()));
+            }
+            final long tConnect = System.nanoTime();
+            long lastKeepAlive = tConnect;
             for (int g = 0; g < gws; g++) {
                 final int gg = g;
                 final int[] mine = java.util.stream.IntStream.rangeClosed(1, users).filter(a -> a % gws == gg).toArray();
-                final Gateway gw = new Gateway(g, mine, node.aeronDirectoryName(), 1, 777 + g);
+                final Gateway gw = sharedAeron != null ? new Gateway(g, mine, sharedAeron, 1, 777 + g)
+                        : new Gateway(g, mine, node.aeronDirectoryName(), 1, 777 + g);
                 gw.retryProbability = retry;
                 gw.depositRetryProbability = depositRetry;
                 gateways.add(gw);
+                if (System.nanoTime() - lastKeepAlive > 1_000_000_000L) { // 建立会话要很久：期间持续给已建好的会话保活
+                    gateways.forEach(Gateway::keepAliveBeforeStart);
+                    lastKeepAlive = System.nanoTime();
+                }
             }
+            System.out.printf("   %d 个集群会话已建立，用时 %.1fs；打开的 fd=%d%n", gws, (System.nanoTime() - tConnect) / 1e9,
+                    new File("/proc/self/fd").list().length);
             for (Gateway g : gateways) {
                 g.queueDeposits(LoadRunner.QUOTE_DEPOSIT, LoadRunner.BASE_DEPOSIT);
             }
-            for (Gateway g : gateways) {
-                final Thread t = new Thread(g, "gateway-" + g.id);
+            final int workers = Math.min(gws, Integer.getInteger("threads", gws));
+            System.out.printf("   %d 个会话由 %d 个工作线程驱动（每个线程轮流服务多个会话）%n", gws, workers);
+            for (int w = 0; w < workers; w++) {
+                final List<Gateway> mine = new ArrayList<>();
+                for (int g = w; g < gws; g += workers) {
+                    mine.add(gateways.get(g));
+                }
+                final Thread t = new Thread(() -> {
+                    final org.agrona.concurrent.BackoffIdleStrategy idle = new org.agrona.concurrent.BackoffIdleStrategy(100, 10, 1_000, 200_000);
+                    boolean stopping = false;
+                    while (!stopping) {
+                        int work = 0;
+                        stopping = true;
+                        for (Gateway g : mine) {
+                            if (!g.stop) {
+                                work += g.step();
+                                stopping = false;
+                            }
+                        }
+                        idle.idle(work);
+                    }
+                    mine.forEach(Gateway::closeCluster);
+                }, "worker-" + w);
+                t.setDaemon(true);
                 t.setUncaughtExceptionHandler((th, e) -> System.out.println("!! " + th.getName() + " died: " + e));
                 threads.add(t);
                 t.start();
@@ -131,6 +187,11 @@ public final class CorrectnessRunner {
             }
             System.out.printf("   负载实际：重试下单 %d 笔（得到“原结果”回复 %d），重试入金 %d 笔，丢失回报 %d 笔%n", retriesSent, dupChecked, depDup, lost);
 
+            // 0 会话全程保持
+            check("0 负载期间没有任何会话被服务端关闭，客户端也没有看到会话关闭",
+                    node.service().sessionsClosed() == 0 && gateways.stream().noneMatch(g -> g.clusterClosed() || g.sessionClosedSeen),
+                    "服务端关闭 " + node.service().sessionsClosed() + " " + node.service().closeReasons()
+                            + "，客户端认为已关闭 " + gateways.stream().filter(Gateway::clusterClosed).count() + " / " + gateways.size());
             // 1 服务健康
             check("1 服务健康、无丢弃、无集群错误",
                     !node.service().halted() && node.service().droppedEvents() == 0 && node.bridge().deduper().gaps() == 0
@@ -278,6 +339,9 @@ public final class CorrectnessRunner {
             }
             for (Thread t : threads) {
                 t.join(5_000);
+            }
+            if (sharedAeron != null) {
+                sharedAeron.close(); // 必须在节点停机之前关闭，否则它发现驱动消失会终止整个 JVM
             }
         }
 

@@ -32,6 +32,8 @@ GOBIN=/usr/local/bin go install github.com/minio/minio@latest   # 需要 Go，�
 ./load.sh projection -Dbatch=1000                 # 只测 事件 → MariaDB 投影吞吐
 ./load.sh sequencer -Dmessages=5000000 -Dmembers=1 # 空服务，只测定序器（并校验序号连续、副本一致、重放哈希一致）
 XMX=8g ./load.sh correctness -Dops=1000000        # 100 万命令的正确性验证：独立参考实现差分、幂等重试、投影对账、重启重放（需要 MariaDB，约 5 分钟）
+XMX=8g ./load.sh correctness -Dgateways=300 -Dthreads=3 -Dwindow=1000 -Dops=1000000   # 超高并发：300 个会话、约 30 万条同时在途
+# 测试与压测的临时数据放在 target/test-tmp、target/load-tmp，每次运行开始前清空；之前放在共享的 /tmp 里，一次会话就累积到 22GB 把磁盘写满
 ```
 
 结果与结论见 [`../docs/architecture.md`](../docs/architecture.md) §5.1。在单机沙箱里跑，数字只用于发现问题，不是容量承诺。

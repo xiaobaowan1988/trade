@@ -18,6 +18,13 @@ import org.agrona.IoUtil;
 public final class ExchangeNode implements AutoCloseable {
     public static final int PORT_BASE = 9000;
     /**
+     * 生产默认的协议超时（秒）。测试在同一个 JVM 里连续起停很多节点，用 Aeron 的默认值（5/10/10 秒）让遗留连接尽快被清掉，
+     * 见 pom.xml 的 argLine；高并发场景由 `./load.sh correctness` 在这些生产默认值下验证。
+     */
+    public static final long DEFAULT_PUBLICATION_CONNECTION_SEC = 60;
+    public static final long DEFAULT_IMAGE_LIVENESS_SEC = 60;
+    public static final long DEFAULT_SESSION_TIMEOUT_SEC = 60;
+    /**
      * 状态机语义版本（major.minor.patch）。**任何改变命令处理结果的改动都必须升版本**（至少 major）：
      * Aeron 会拒绝用不兼容版本加载旧快照/日志，而不是用新逻辑重放旧日志得到另一个状态。
      */
@@ -75,13 +82,33 @@ public final class ExchangeNode implements AutoCloseable {
         config.baseDir(baseDir);
         config.aeronDirectoryName(new File(baseDir, "aeron").getAbsolutePath()); // 放磁盘而非 /dev/shm，容器内更稳
         config.errorHandler(Throwable::printStackTrace);
-        config.mediaDriverContext().threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true);
+        // 默认专用线程：共享模式下发送/接收/管理都挤在一个线程里，几百个会话就会让它满载，保活被拖住、
+        // 会话被判超时关闭，之后这些会话上的命令被静默丢弃（实测，见设计 §5.5）。核数很少的开发/测试环境可以
+        // 用 -Dexchange.threading=shared 切回共享。
+        final boolean dedicated = !"shared".equals(System.getProperty("exchange.threading", "dedicated"));
+        // 发布连接超时（默认 5 秒）：发布端 5 秒收不到接收端的状态消息就认为连接已断、停止发送（连心跳也不发），
+        // 接收端的镜像随之不可用，共识模块立刻把该会话以 TIMEOUT 关闭，之后该会话上的命令被静默丢弃。
+        // 几百个会话 + CPU 吃满时，状态消息会被拖到超过 5 秒（实测：600 会话下数秒内 54 到 590 个会话被关闭；
+        // 只把这一个超时放宽到 60 秒，会话全部存活、所有正确性检查通过；只放宽镜像存活超时则没有用）。
+        // 按“可以慢，不能出错”的原则放宽；Raft 的故障检测由 leader 心跳超时负责，不受影响。
+        // 注意：这个值在**发送端的驱动**上生效，网关自己的 MediaDriver 也必须同样设置。
+        config.mediaDriverContext().publicationConnectionTimeoutNs(
+                java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("exchange.publicationConnectionSec", DEFAULT_PUBLICATION_CONNECTION_SEC)));
+        // 同理：会话超时与镜像存活超时也必须比最坏的“慢”更宽。实测 30 万条同时在途时排队延迟达到 10 秒，
+        // 超过默认的 10 秒会话超时，入口被背压的会话连保活都发不出去，被集群以 TIMEOUT 关闭。
+        // 这三个超时要配套：发布连接 ≤ 镜像存活，会话超时不小于它们；客户端的连接超时要大于发布连接超时。
+        config.mediaDriverContext().imageLivenessTimeoutNs(
+                java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("exchange.imageLivenessSec", DEFAULT_IMAGE_LIVENESS_SEC)));
+        config.mediaDriverContext().threadingMode(dedicated ? ThreadingMode.DEDICATED : ThreadingMode.SHARED).dirDeleteOnStart(true);
         config.consensusModuleContext()
                 .ingressChannel("aeron:udp?term-length=64k")
                 .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(200))
                 .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)) // 默认 10s，缩短以加快故障切换
                 // Aeron 默认只允许 10 个并发会话；用户经网关复用进集群，所以这里按“网关数 + 运维连接”配置
-                .maxConcurrentSessions(1_000);
+                // 并发会话上限：已验证 600 个会话 + 满载下无错（见设计 §5.5）；1000 个会话时连建立都不可靠。
+                // 超出上限的会话被明确拒绝，而不是让所有会话一起降级。用户经网关复用，正常只需要几个到几十个会话。
+                .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("exchange.sessionTimeoutSec", DEFAULT_SESSION_TIMEOUT_SEC)))
+                .maxConcurrentSessions(Integer.getInteger("exchange.maxSessions", 512));
         config.consensusModuleContext().appVersion(STATE_MACHINE_VERSION);
         config.clusteredServiceContext().appVersion(STATE_MACHINE_VERSION);
         // 先持久、再确认：Aeron 默认 fileSyncLevel=0 只写页缓存，整机断电会丢“已确认”的订单。2=fsync 数据与元数据。
@@ -90,7 +117,8 @@ public final class ExchangeNode implements AutoCloseable {
         config.archiveContext()
                 .recordChecksum(io.aeron.archive.checksum.Checksums.crc32c())
                 .replayChecksum(io.aeron.archive.checksum.Checksums.crc32c());
-        config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
+        config.archiveContext().deleteArchiveOnStart(false)
+                .threadingMode(dedicated ? io.aeron.archive.ArchiveThreadingMode.DEDICATED : io.aeron.archive.ArchiveThreadingMode.SHARED);
 
         customizer.accept(config);
         final ClusteredMediaDriver driver = ClusteredMediaDriver.launch(
@@ -114,6 +142,9 @@ public final class ExchangeNode implements AutoCloseable {
     public String archiveControlEndpoint() {
         return HOST + ":" + ClusterConfig.calculatePort(memberId, PORT_BASE, ClusterConfig.ARCHIVE_CONTROL_PORT_OFFSET);
     }
+
+    /** 驱动的发布连接超时（纳秒）。 */
+    public long publicationConnectionTimeoutNs() { return driver.mediaDriver().context().publicationConnectionTimeoutNs(); }
 
     public String aeronDirectoryName() { return driver.mediaDriver().aeronDirectoryName(); }
 

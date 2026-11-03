@@ -35,7 +35,7 @@ class VersionGuardTest {
         })) {
             // 节点起不来：客户端连不上，也得不到任何服务
             assertThrows(Exception.class, () -> {
-                try (ExchangeClient c = new ExchangeClient(node.aeronDirectoryName())) {
+                try (ExchangeClient c = new ExchangeClient(node.aeronDirectoryName(), 3_000)) { // 期望连不上：快速失败
                     c.deposit(2, ASSET_QUOTE, 1_000);
                     c.await(1, 3_000);
                 }
@@ -46,5 +46,17 @@ class VersionGuardTest {
             }
             assertTrue(errors.stream().anyMatch(e -> e.contains("incompatible")), "明确报告版本不兼容: " + errors);
         }
+    }
+
+    /**
+     * 防止配置回退：Aeron 默认的 5/10/10 秒协议超时，在几百个会话 + 满载时会让会话被集体超时关闭、命令被静默丢弃
+     * （实测，见设计 §5.5）。测试环境为了在同一个 JVM 里快速起停节点，用系统属性把它们调回了 Aeron 默认值，
+     * 所以这里断言的是**生产默认值常量**；真正的回归验证是 `./load.sh correctness -Dgateways=600`。
+     */
+    @Test
+    void productionProtocolTimeoutsAreGenerous() {
+        assertTrue(ExchangeNode.DEFAULT_PUBLICATION_CONNECTION_SEC >= 30);
+        assertTrue(ExchangeNode.DEFAULT_IMAGE_LIVENESS_SEC >= 30);
+        assertTrue(ExchangeNode.DEFAULT_SESSION_TIMEOUT_SEC >= 30);
     }
 }

@@ -4,11 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mvn -q -B test-compile dependency:build-classpath -Dmdep.outputFile=target/cp-test.txt -Dmdep.includeScope=test
+# 压测的临时数据放在 target/load-tmp，每次开始前清掉，不污染共享的 /tmp
+rm -rf target/load-tmp && mkdir -p target/load-tmp
 MAIN=jp.trade.exchange.load.LoadRunner
 if [ "${1:-}" = "sessions" ]; then MAIN=jp.trade.exchange.load.SessionStorm; shift; fi
 if [ "${1:-}" = "projection" ]; then MAIN=jp.trade.exchange.load.ProjectionBench; shift; fi
 if [ "${1:-}" = "sequencer" ]; then MAIN=jp.trade.exchange.load.SequencerBench; shift; fi
 if [ "${1:-}" = "correctness" ]; then MAIN=jp.trade.exchange.load.CorrectnessRunner; shift; fi
 exec java --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.util.zip=ALL-UNNAMED \
-  --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Xmx${XMX:-4g} -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 "$@" \
+  --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Xmx${XMX:-4g} -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Djava.io.tmpdir=target/load-tmp "$@" \
   -cp "target/test-classes:target/classes:$(cat target/cp-test.txt)" $MAIN

@@ -55,7 +55,7 @@ class StorageIntegrityTest {
         final LoggingEventSink sink = new LoggingEventSink(false);
         try (ExchangeNode node = ExchangeNode.start(0, 1, dir, false, sink, cfg -> cfg.errorHandler(e -> errors.add(String.valueOf(e))))) {
             assertThrows(Exception.class, () -> {
-                try (ExchangeClient c = new ExchangeClient(node.aeronDirectoryName())) {
+                try (ExchangeClient c = new ExchangeClient(node.aeronDirectoryName(), 3_000)) { // 期望连不上：快速失败
                     c.deposit(9, ASSET_QUOTE, 5);
                     c.await(1, 3_000);
                 }

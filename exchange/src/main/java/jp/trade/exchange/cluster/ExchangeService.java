@@ -62,7 +62,7 @@ public final class ExchangeService implements ClusteredService {
     private java.util.function.Consumer<Throwable> fatalHandler = ExchangeService::haltJvm;
     /** 测试用故障注入：处理第 N 条命令时抛异常（0=关闭）。 */
     private volatile long injectFailureAtCommand;
-    private long commandCount;
+    private volatile long commandCount;
     private volatile Cluster.Role role = Cluster.Role.FOLLOWER;
 
     // ---- 事件发布缓冲背压策略（“可以慢，不能丢”）----
@@ -106,11 +106,26 @@ public final class ExchangeService implements ClusteredService {
         }
     }
 
-    @Override
-    public void onSessionOpen(ClientSession session, long timestamp) {}
+    private volatile long sessionsOpened;
+    private volatile long sessionsClosed;
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> closeReasons = new java.util.concurrent.ConcurrentHashMap<>();
 
     @Override
-    public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {}
+    public void onSessionOpen(ClientSession session, long timestamp) {
+        sessionsOpened++;
+    }
+
+    @Override
+    public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        sessionsClosed++;
+        closeReasons.merge(String.valueOf(closeReason), 1L, Long::sum);
+    }
+
+    public long sessionsOpened() { return sessionsOpened; }
+    public long sessionsClosed() { return sessionsClosed; }
+
+    /** 会话被关闭的原因及次数（CLIENT_ACTION、TIMEOUT、SERVICE_ACTION 等）。 */
+    public java.util.Map<String, Long> closeReasons() { return java.util.Map.copyOf(closeReasons); }
 
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer, int offset, int length, Header header) {
@@ -242,6 +257,9 @@ public final class ExchangeService implements ClusteredService {
     }
 
     public boolean halted() { return halted; }
+
+    /** 已应用的命令数（含被拒绝的）。 */
+    public long commandsApplied() { return commandCount; }
 
     /** 仅测试：设置命令记录接口。 */
     public ExchangeService commandTap(CommandTap tap) {

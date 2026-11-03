@@ -36,6 +36,9 @@ public final class SessionStorm {
             if (!"default".equals(max)) {
                 cfg.consensusModuleContext().maxConcurrentSessions(Integer.parseInt(max));
             }
+            if (Long.getLong("sessionTimeoutSec") != null) {
+                cfg.consensusModuleContext().sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(Long.getLong("sessionTimeoutSec")));
+            }
             if (Boolean.getBoolean("dedicated")) {
                 cfg.mediaDriverContext().threadingMode(io.aeron.driver.ThreadingMode.DEDICATED);
                 System.out.println("MediaDriver 线程模型: DEDICATED（conductor/sender/receiver 各一个线程）");
@@ -61,6 +64,7 @@ public final class SessionStorm {
         final Map<String, Integer> failures = new LinkedHashMap<>();
         final long t0 = System.nanoTime();
         long lastPrint = t0;
+        long lastKeepAlive = t0;
         int attempts = 0;
         try {
             for (int i = 0; i < sessions; i++) {
@@ -81,6 +85,12 @@ public final class SessionStorm {
                         System.out.println("失败已达 20 次，停止继续建立会话");
                         break;
                     }
+                }
+                if (System.nanoTime() - lastKeepAlive > 1_000_000_000L) { // 建立会话期间持续给已建好的会话保活
+                    for (AeronCluster c : clients) {
+                        c.sendKeepAlive();
+                    }
+                    lastKeepAlive = System.nanoTime();
                 }
                 if (System.nanoTime() - lastPrint > 5_000_000_000L) {
                     lastPrint = System.nanoTime();
@@ -123,7 +133,8 @@ public final class SessionStorm {
                     (System.nanoTime() - t1) / 1e9);
 
             // 保活：10 秒（超过默认的会话超时），看会话是否都还在
-            final long keepUntil = System.currentTimeMillis() + 12_000;
+            final long holdMs = Long.getLong("hold", 12) * 1000;
+            final long keepUntil = System.currentTimeMillis() + holdMs;
             while (System.currentTimeMillis() < keepUntil) {
                 for (AeronCluster c : clients) {
                     c.sendKeepAlive();
@@ -137,7 +148,8 @@ public final class SessionStorm {
                     closed++;
                 }
             }
-            System.out.printf("保活 12s 后：仍在线 %d，已被集群关闭 %d%n", clients.size() - closed, closed);
+            System.out.printf("保活 %ds 后：仍在线 %d，已被集群关闭 %d；服务端会话 打开 %d 关闭 %d %s%n", holdMs / 1000, clients.size() - closed, closed,
+                    node.service().sessionsOpened(), node.service().sessionsClosed(), node.service().closeReasons());
         } finally {
             System.out.println("集群/驱动错误计数: " + nodeErrors.get());
             for (AeronCluster c : clients) {
@@ -153,7 +165,7 @@ public final class SessionStorm {
     }
 
     private static boolean offerWithRetry(AeronCluster c, ExpandableArrayBuffer buf, int len) {
-        final long deadline = System.currentTimeMillis() + 5_000;
+        final long deadline = System.currentTimeMillis() + 500;
         while (c.offer(buf, 0, len) < 0) {
             if (System.currentTimeMillis() > deadline) {
                 return false;

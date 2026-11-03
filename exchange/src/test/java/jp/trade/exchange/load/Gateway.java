@@ -60,16 +60,60 @@ final class Gateway implements Runnable, EgressListener {
     private final Map<Integer, Integer> nextCid = new HashMap<>();
 
     Gateway(int id, int[] accounts, String aeronDir, int memberCount, long seed) {
+        this(id, accounts, aeronDir, null, memberCount, seed);
+    }
+
+    /** 共享同一个 Aeron 客户端（几百个会话时避免每个会话各起一套客户端线程）。 */
+    Gateway(int id, int[] accounts, io.aeron.Aeron shared, int memberCount, long seed) {
+        this(id, accounts, null, shared, memberCount, seed);
+    }
+
+    private Gateway(int id, int[] accounts, String aeronDir, io.aeron.Aeron shared, int memberCount, long seed) {
         this.id = id;
         this.accounts = accounts;
         this.rnd = new Random(seed);
-        this.cluster = AeronCluster.connect(new AeronCluster.Context()
-                .aeronDirectoryName(aeronDir)
+        final AeronCluster.Context ctx = new AeronCluster.Context()
                 .egressListener(this)
-                .ingressChannel("aeron:udp?term-length=1m")
+                .ingressChannel("aeron:udp?term-length=" + System.getProperty("ingressTerm", "1m"))
                 .ingressEndpoints(ClusterConfig.ingressEndpoints(
                         ExchangeNode.hostnames(memberCount), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
-                .egressChannel("aeron:udp?endpoint=localhost:0|term-length=1m"));
+                .egressChannel("aeron:udp?endpoint=localhost:0|term-length=" + System.getProperty("egressTerm", "1m"))
+                .messageTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(10)); // 每次尝试 10 秒；失败则换新的发布端重试，见 connectWithRetry
+        if (shared != null) {
+            ctx.aeron(shared).ownsAeronClient(false);
+        } else {
+            ctx.aeronDirectoryName(aeronDir);
+        }
+        this.cluster = connectWithRetry(ctx, aeronDir, shared, memberCount);
+    }
+
+    /** 连接失败就换新的发布端重试（总期限 connectTimeoutSec）。几百个会话同时建立时，个别连接失败很常见。 */
+    private AeronCluster connectWithRetry(AeronCluster.Context first, String aeronDir, io.aeron.Aeron shared, int memberCount) {
+        final long deadline = System.currentTimeMillis() + Long.getLong("connectTimeoutSec", 120) * 1000;
+        RuntimeException last = null;
+        AeronCluster.Context ctx = first;
+        while (true) {
+            try {
+                return AeronCluster.connect(ctx);
+            } catch (io.aeron.exceptions.TimeoutException e) {
+                last = e;
+                if (System.currentTimeMillis() > deadline) {
+                    throw last;
+                }
+                ctx = new AeronCluster.Context()
+                        .egressListener(this)
+                        .ingressChannel("aeron:udp?term-length=" + System.getProperty("ingressTerm", "1m"))
+                        .ingressEndpoints(ClusterConfig.ingressEndpoints(
+                                ExchangeNode.hostnames(memberCount), ExchangeNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
+                        .egressChannel("aeron:udp?endpoint=localhost:0|term-length=" + System.getProperty("egressTerm", "1m"))
+                        .messageTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(10));
+                if (shared != null) {
+                    ctx.aeron(shared).ownsAeronClient(false);
+                } else {
+                    ctx.aeronDirectoryName(aeronDir);
+                }
+            }
+        }
     }
 
     // ---------- egress ----------
@@ -175,6 +219,13 @@ final class Gateway implements Runnable, EgressListener {
 
     boolean phaseDone() { return phaseDone; }
 
+    boolean clusterClosed() { return cluster.isClosed(); }
+
+    /** 建立大量会话期间，对先建好的会话保活（否则它们在工作线程启动前就超时了）。只能在工作线程启动前由单个线程调用。 */
+    void keepAliveBeforeStart() {
+        cluster.sendKeepAlive();
+    }
+
     /** 清零统计，阶段之间调用（此时线程处于空闲）。 */
     void resetStats() {
         latCount = 0;
@@ -221,16 +272,37 @@ final class Gateway implements Runnable, EgressListener {
         }
     }
 
+    // 运行状态（由 step() 维护，使多个网关可以复用同一个线程）
+    private long lastKeepAlive = System.nanoTime();
+    private int seenPhase;
+    private long sentThisPhase;
+    private long nextSlot;
+    private long phaseStart;
+    volatile boolean sessionClosedSeen;
+
     @Override
     public void run() {
         final IdleStrategy idle = new BackoffIdleStrategy(100, 10, 1_000, 200_000);
-        long lastKeepAlive = System.nanoTime();
-        int seenPhase = 0;
-        long sentThisPhase = 0;
-        long baseAccepted = 0;
-        long nextSlot = 0;
-        long phaseStart = 0;
         while (!stop) {
+            idle.idle(step());
+        }
+        closeCluster();
+    }
+
+    void closeCluster() {
+        try {
+            cluster.close();
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    /** 一轮：消费 egress、发开户入金、按窗口发命令、保活。返回做了多少工作（用于空闲退避）。 */
+    int step() {
+        {
+            if (cluster.isClosed()) {
+                sessionClosedSeen = true;
+                return 0;
+            }
             if (phase != seenPhase) {
                 seenPhase = phase;
                 sentThisPhase = 0;
@@ -286,9 +358,8 @@ final class Gateway implements Runnable, EgressListener {
                 cluster.sendKeepAlive();
                 lastKeepAlive = System.nanoTime();
             }
-            idle.idle(work);
+            return work;
         }
-        cluster.close();
     }
 
     private boolean sendOne(long intendedNs) {
