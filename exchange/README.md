@@ -31,6 +31,7 @@ GOBIN=/usr/local/bin go install github.com/minio/minio@latest   # 需要 Go，�
 ./load.sh sessions -Dsessions=10000 -Dmax=20000   # 直接建 1 万个原始集群会话（会在几百到两千个之后失败，见设计 §5.1）
 ./load.sh projection -Dbatch=1000                 # 只测 事件 → MariaDB 投影吞吐
 ./load.sh sequencer -Dmessages=5000000 -Dmembers=1 # 空服务，只测定序器（并校验序号连续、副本一致、重放哈希一致）
+XMX=8g ./load.sh correctness -Dops=1000000        # 100 万命令的正确性验证：独立参考实现差分、幂等重试、投影对账、重启重放（需要 MariaDB，约 5 分钟）
 ```
 
 结果与结论见 [`../docs/architecture.md`](../docs/architecture.md) §5.1。在单机沙箱里跑，数字只用于发现问题，不是容量承诺。

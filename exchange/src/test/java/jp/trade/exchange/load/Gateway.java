@@ -44,8 +44,17 @@ final class Gateway implements Runnable, EgressListener {
     private volatile long lastEgressNs = System.nanoTime();
     long cancelsSent, cancelled, cancelRejected, trades;
     long backPressure, notConnected, adminAction, otherOfferFail;
-    long rejectsByReason[] = new long[8];
+    long rejectsByReason[] = new long[9];
 
+    // ---- 重试与客户端视角（用于验证“重试取回原结果、不重复生效”）----
+    volatile double retryProbability;          // 每笔下单被确认后，再用同一个 clientOrderId 重发一次的概率（模拟“回报丢了，超时重试”）
+    volatile double depositRetryProbability;
+    private final Map<Long, long[]> retryParams = new HashMap<>();          // key → {side, price, qty}，等回报到达后重发
+    private final java.util.ArrayDeque<long[]> retryQueue = new java.util.ArrayDeque<>(); // {account, cid, side, price, qty}
+    /** 客户端观察到的每个 (账户, clientOrderId) 的结果：>0 订单号，<0 拒绝原因的负数。 */
+    final Map<Long, Long> observed = new HashMap<>();
+    private final Map<Long, Long> depositAmount = new HashMap<>();          // (账户<<3|资产) → 金额
+    long retriesSent, dupChecked, dupMismatch, dupLearned, depositDupChecked, depositDupMismatch;
     private final Map<Long, Long> sentAt = new HashMap<>();             // key=account<<32|cid → 预定发送时间
     private final Map<Integer, ArrayDeque<Long>> resting = new HashMap<>();
     private final Map<Integer, Integer> nextCid = new HashMap<>();
@@ -78,6 +87,12 @@ final class Gateway implements Runnable, EgressListener {
             case EVT_ACCEPTED -> {
                 accepted++;
                 final long cid = eventCounterOrderId(b, offset);
+                final long pk = (account << 32) | cid;
+                observed.putIfAbsent(pk, eventOrderId(b, offset));
+                final long[] rp = retryParams.remove(pk);
+                if (rp != null) {
+                    retryQueue.add(new long[]{account, cid, rp[0], rp[1], rp[2]});
+                }
                 if (!record(account, cid)) {
                     late();
                 }
@@ -89,14 +104,37 @@ final class Gateway implements Runnable, EgressListener {
             }
             case EVT_REJECTED -> {
                 final long reason = eventQty(b, offset);
-                rejectsByReason[(int) Math.min(reason, 7)]++;
-                if (reason != REJECT_UNKNOWN_ORDER && reason != REJECT_DUPLICATE_CANCEL) { // 这两种原因只会来自撤单；其余是下单被拒
+                rejectsByReason[(int) Math.min(reason, 8)]++;
+                if (reason == REJECT_DUPLICATE_DEPOSIT) {
+                    // 入金重试：必须返回原金额，且不再入账
+                    depositDupChecked++;
+                    final Long expected = depositAmount.get((account << 3) | eventCounterOrderId(b, offset));
+                    if (expected == null || expected != eventPrice(b, offset)) {
+                        depositDupMismatch++;
+                    }
+                } else if (reason == REJECT_UNKNOWN_ORDER || reason == REJECT_DUPLICATE_CANCEL) {
+                    cancelRejected++;
+                } else {
                     rejectedPlaces++;
-                    if (!record(account, eventCounterOrderId(b, offset))) {
+                    final long cid = eventCounterOrderId(b, offset);
+                    final long pk = (account << 32) | cid;
+                    if (reason == REJECT_DUPLICATE_CLIENT_ORDER) {
+                        // 重试得到的“原结果”：原订单号（或原拒绝原因）必须与我们之前看到的一致
+                        dupChecked++;
+                        final long claimed = eventOrderId(b, offset) > 0 ? eventOrderId(b, offset) : -eventPrice(b, offset);
+                        final Long seen = observed.get(pk);
+                        if (seen == null) {
+                            observed.put(pk, claimed); // 原回报丢了，靠重试取回
+                            dupLearned++;
+                        } else if (seen != claimed) {
+                            dupMismatch++;
+                        }
+                    } else {
+                        observed.putIfAbsent(pk, -reason);
+                    }
+                    if (!record(account, cid)) {
                         late();
                     }
-                } else {
-                    cancelRejected++;
                 }
             }
             case EVT_CANCELLED -> cancelled++;
@@ -158,9 +196,13 @@ final class Gateway implements Runnable, EgressListener {
         }
     }
 
+    volatile long depositRetriesSent;
+
     private void pumpDeposits() {
-        for (int i = 0; i < 64 && !depositQueue.isEmpty() && depositsSent - deposited < 500; i++) {
+        // 重试的入金不会产生 DEPOSITED 确认，所以窗口要扣掉它们
+        for (int i = 0; i < 64 && !depositQueue.isEmpty() && depositsSent - depositRetriesSent - deposited < 500; i++) {
             final long[] d = depositQueue.peekFirst();
+            final boolean isRetry = d.length == 4;
             final int len = encodeCommand(buf, 0, CMD_DEPOSIT, (int) d[1], d[0], d[2], d[1], 0); // depositId=资产号，每账户每资产一笔
             if (cluster.offer(buf, 0, len) < 0) {
                 backPressure++;
@@ -168,6 +210,14 @@ final class Gateway implements Runnable, EgressListener {
             }
             depositQueue.pollFirst();
             depositsSent++;
+            if (isRetry) {
+                depositRetriesSent++;
+            } else {
+                depositAmount.put((d[0] << 3) | d[1], d[2]);
+                if (rnd.nextDouble() < depositRetryProbability) {
+                    depositQueue.addFirst(new long[]{d[0], d[1], d[2], 1}); // 同一个 depositId 再发一次（同一会话保证它在原件之后被处理）
+                }
+            }
         }
     }
 
@@ -242,6 +292,20 @@ final class Gateway implements Runnable, EgressListener {
     }
 
     private boolean sendOne(long intendedNs) {
+        if (!retryQueue.isEmpty()) {
+            final long[] r = retryQueue.peekFirst();
+            final int len = encodeCommand(buf, 0, CMD_PLACE, (int) r[2], r[0], r[1], r[3], r[4]);
+            final long res = cluster.offer(buf, 0, len);
+            if (res < 0) {
+                backPressure++;
+                return false;
+            }
+            retryQueue.pollFirst();
+            placesSent++;
+            retriesSent++;
+            sentAt.put((r[0] << 32) | r[1], intendedNs);
+            return true;
+        }
         final int account = accounts[rnd.nextInt(accounts.length)];
         final boolean cancel = rnd.nextInt(10) == 0 && resting.containsKey(account) && !resting.get(account).isEmpty();
         final long result;
@@ -264,6 +328,9 @@ final class Gateway implements Runnable, EgressListener {
             if (result >= 0) {
                 placesSent++;
                 sentAt.put(((long) account << 32) | cid, intendedNs);
+                if (rnd.nextDouble() < retryProbability) {
+                    retryParams.put(((long) account << 32) | cid, new long[]{side, price, qty});
+                }
             } else {
                 nextCid.merge(account, -1, Integer::sum); // 没发出去，cid 回退
             }

@@ -47,8 +47,16 @@ public final class ExchangeService implements ClusteredService {
     private final long[] checkpointOut = new long[2];
     private final ExpandableArrayBuffer checkBuf = new ExpandableArrayBuffer(CHECK_LENGTH);
     private volatile long checkpointsSent;
+    private volatile long checkpointsFailed;
+    private long checkpointWaitNs = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
     private volatile long checkpointsVerified;
     private volatile long checkpointsUnverifiable;
+    /** 仅测试：按日志实际应用的顺序拿到每条命令（用来喂独立的参考实现做差分验证）。 */
+    public interface CommandTap {
+        void onCommand(long timestamp, byte[] command);
+    }
+
+    private volatile CommandTap commandTap;
     private volatile boolean halted;
     private volatile Throwable fatalCause;
     private java.util.function.Consumer<Throwable> fatalHandler = ExchangeService::haltJvm;
@@ -121,6 +129,12 @@ public final class ExchangeService implements ClusteredService {
             if (++commandCount == injectFailureAtCommand) {
                 throw new IllegalStateException("injected failure at command " + commandCount);
             }
+            final CommandTap tap = commandTap;
+            if (tap != null) {
+                final byte[] copy = new byte[length];
+                buffer.getBytes(offset, copy);
+                tap.onCommand(timestamp, copy);
+            }
             engine.onCommand(buffer, offset, length, timestamp, handler);
             if (engine.takeCheckpoint(checkpointOut)) {
                 sendCheckpoint(checkpointOut[0], checkpointOut[1]);
@@ -142,10 +156,32 @@ public final class ExchangeService implements ClusteredService {
         checkBuf.putInt(0, CHECK_MAGIC);
         checkBuf.putLong(4, seq);
         checkBuf.putLong(12, chain);
-        // 所有副本在同一个逻辑位置做同一个调用；Aeron 保证日志里只追加一份（以 leader 的为准）
-        if (cluster.offer(checkBuf, 0, CHECK_LENGTH) >= 0) {
+        // 所有副本在同一个逻辑位置做同一个调用；Aeron 保证日志里只追加一份（以 leader 的为准）。
+        // 满载时 offer 可能被背压拒绝：leader 上有界等待重试（可以慢），否则这个检查点会静默缺失、悄悄削弱检测覆盖。
+        // 只有 leader 的结果有意义，follower 不等待。
+        final long maxWait = cluster.role() == Cluster.Role.LEADER ? checkpointWaitNs : 0;
+        final long r = offerBounded(cluster::offer, checkBuf, CHECK_LENGTH, maxWait, () -> cluster.idleStrategy().idle());
+        if (r >= 0) {
             checkpointsSent++;
+        } else if (cluster.role() == Cluster.Role.LEADER) {
+            checkpointsFailed++;
         }
+    }
+
+    /**
+     * offer 并在失败时有界等待重试：ADMIN_ACTION 立即重试；BACK_PRESSURED/NOT_CONNECTED 等待到 maxWaitNs；
+     * CLOSED / MAX_POSITION_EXCEEDED 立即放弃（重试没有意义）。
+     */
+    static long offerBounded(Offerer o, DirectBuffer buf, int length, long maxWaitNs, Runnable idle) {
+        long r = o.offer(buf, 0, length);
+        final long deadline = System.nanoTime() + maxWaitNs;
+        while (r < 0 && r != Publication.CLOSED && r != Publication.MAX_POSITION_EXCEEDED && System.nanoTime() < deadline) {
+            if (r != Publication.ADMIN_ACTION) {
+                idle.run();
+            }
+            r = o.offer(buf, 0, length);
+        }
+        return r;
     }
 
     private void onCheckpointMessage(ClientSession session, DirectBuffer buffer, int offset) {
@@ -164,6 +200,9 @@ public final class ExchangeService implements ClusteredService {
     }
 
     public long checkpointsSent() { return checkpointsSent; }
+
+    /** leader 上因 offer 一直被拒而未能写入日志的检查点数（应为 0，否则该检查点缺失、检测覆盖被削弱）。 */
+    public long checkpointsFailed() { return checkpointsFailed; }
     public long checkpointsVerified() { return checkpointsVerified; }
     public long checkpointsUnverifiable() { return checkpointsUnverifiable; }
 
@@ -203,6 +242,12 @@ public final class ExchangeService implements ClusteredService {
     }
 
     public boolean halted() { return halted; }
+
+    /** 仅测试：设置命令记录接口。 */
+    public ExchangeService commandTap(CommandTap tap) {
+        this.commandTap = tap;
+        return this;
+    }
 
     public Throwable fatalCause() { return fatalCause; }
 

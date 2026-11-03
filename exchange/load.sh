@@ -8,6 +8,7 @@ MAIN=jp.trade.exchange.load.LoadRunner
 if [ "${1:-}" = "sessions" ]; then MAIN=jp.trade.exchange.load.SessionStorm; shift; fi
 if [ "${1:-}" = "projection" ]; then MAIN=jp.trade.exchange.load.ProjectionBench; shift; fi
 if [ "${1:-}" = "sequencer" ]; then MAIN=jp.trade.exchange.load.SequencerBench; shift; fi
+if [ "${1:-}" = "correctness" ]; then MAIN=jp.trade.exchange.load.CorrectnessRunner; shift; fi
 exec java --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.util.zip=ALL-UNNAMED \
-  --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Xmx4g -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 "$@" \
+  --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Xmx${XMX:-4g} -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 "$@" \
   -cp "target/test-classes:target/classes:$(cat target/cp-test.txt)" $MAIN

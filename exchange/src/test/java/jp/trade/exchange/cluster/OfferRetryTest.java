@@ -49,4 +49,35 @@ class OfferRetryTest {
         ExchangeService.offerRetryingAdminAction(script(calls, Publication.NOT_CONNECTED), buf);
         assertEquals(1, calls.get());
     }
+
+    // ---- 检查点的 offer：满载时曾被背压拒绝一次，该检查点静默缺失（100 万命令的正确性验证发现） ----
+
+    @Test
+    void checkpointOfferWaitsOutBackPressureInsteadOfSilentlySkipping() {
+        final AtomicInteger calls = new AtomicInteger();
+        final AtomicInteger idles = new AtomicInteger();
+        final long r = ExchangeService.offerBounded(script(calls, Publication.BACK_PRESSURED, Publication.BACK_PRESSURED, 99),
+                buf, 20, 1_000_000_000L, idles::incrementAndGet);
+        assertEquals(99, r);
+        assertEquals(3, calls.get());
+        assertEquals(2, idles.get(), "背压期间让出 CPU 等待，而不是空转或放弃");
+    }
+
+    @Test
+    void checkpointOfferGivesUpAfterTheBoundAndReportsFailure() {
+        final AtomicInteger calls = new AtomicInteger();
+        final long r = ExchangeService.offerBounded(script(calls, Publication.BACK_PRESSURED), buf, 20, 20_000_000L, () -> { });
+        assertEquals(Publication.BACK_PRESSURED, r, "有界：到点放弃，由调用方计入失败，而不是无限等待");
+        assertTrue(calls.get() > 1);
+    }
+
+    @Test
+    void checkpointOfferDoesNotWaitOnClosedAndDoesNotWaitAtAllOnFollowers() {
+        final AtomicInteger calls = new AtomicInteger();
+        assertEquals(Publication.CLOSED, ExchangeService.offerBounded(script(calls, Publication.CLOSED), buf, 20, 5_000_000_000L, () -> { }));
+        assertEquals(1, calls.get());
+        final AtomicInteger c2 = new AtomicInteger();
+        ExchangeService.offerBounded(script(c2, Publication.BACK_PRESSURED), buf, 20, 0, () -> { }); // follower：maxWait=0
+        assertEquals(1, c2.get(), "follower 不等待");
+    }
 }
