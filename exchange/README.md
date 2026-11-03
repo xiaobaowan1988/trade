@@ -23,3 +23,13 @@ mvn test        # 单元、单节点集成、3 节点故障切换、补数测试
 ```bash
 GOBIN=/usr/local/bin go install github.com/minio/minio@latest   # 需要 Go，首次编译约几分钟
 ```
+
+## 压测
+
+```bash
+./load.sh                      # 1 万活跃账户 × 3 个网关会话：限速看延迟、不限速看吞吐，再做全量一致性校验并投影到 MariaDB
+./load.sh sessions -Dsessions=10000 -Dmax=20000   # 直接建 1 万个原始集群会话（会在几百到两千个之后失败，见设计 §5.1）
+./load.sh projection -Dbatch=1000                 # 只测 事件 → MariaDB 投影吞吐
+```
+
+结果与结论见 [`../docs/architecture.md`](../docs/architecture.md) §5.1。在单机沙箱里跑，数字只用于发现问题，不是容量承诺。

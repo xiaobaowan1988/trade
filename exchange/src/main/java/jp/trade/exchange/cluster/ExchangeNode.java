@@ -66,7 +66,9 @@ public final class ExchangeNode implements AutoCloseable {
         config.consensusModuleContext()
                 .ingressChannel("aeron:udp?term-length=64k")
                 .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(200))
-                .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)); // 默认 10s，缩短以加快故障切换
+                .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)) // 默认 10s，缩短以加快故障切换
+                // Aeron 默认只允许 10 个并发会话；用户经网关复用进集群，所以这里按“网关数 + 运维连接”配置
+                .maxConcurrentSessions(1_000);
         config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
 
         customizer.accept(config);

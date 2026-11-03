@@ -37,6 +37,7 @@ public final class ExchangeService implements ClusteredService {
     private ClientSession currentSession;
     private boolean leader;
     private long droppedEvents;
+    private volatile long egressDropped;
     private volatile boolean loadedFromSnapshot;
     private volatile Cluster.Role role = Cluster.Role.FOLLOWER;
 
@@ -72,14 +73,38 @@ public final class ExchangeService implements ClusteredService {
             return; // 只有 leader 对外发布；follower 仅推进状态
         }
         encodeEvent(eventBuf, 0, type, aux, seq, ts, orderId, account, price, qty, counterOrderId, counterAccount);
-        // 撮合线程绝不自旋等待：IPC 背压时丢弃并计数，缺口由下游序号检测、由日志重放补数
-        final long r = eventPublication.offer(eventView, 0, EVENT_LENGTH);
-        if (r < 0) {
+        // 撮合线程绝不自旋等待：真正的背压（BACK_PRESSURED）时丢弃并计数，缺口由下游序号检测、由日志重放补数。
+        // 但 ADMIN_ACTION（发布缓冲 term 轮转）是“立即重试即可”的瞬时状态，不是背压，必须重试，否则会平白丢事件。
+        if (offerRetryingAdminAction(eventPublication, eventView) < 0) {
             droppedEvents++;
         }
         if (currentSession != null) {
-            currentSession.offer(eventView, 0, EVENT_LENGTH); // 请求方确认/成交回报，失败不影响状态
+            // 请求方确认/成交回报：尽力而为，背压时丢弃（不影响状态，也不阻塞撮合线程），客户端必须靠超时 + 幂等重试对账
+            if (offerRetryingAdminAction(currentSession, eventView) < 0) {
+                egressDropped++;
+            }
         }
+    }
+
+    interface Offerer {
+        long offer(org.agrona.DirectBuffer buffer, int offset, int length);
+    }
+
+    private static long offerRetryingAdminAction(Publication pub, DirectBuffer buf) {
+        return offerRetryingAdminAction(pub::offer, buf);
+    }
+
+    private static long offerRetryingAdminAction(ClientSession session, DirectBuffer buf) {
+        return offerRetryingAdminAction(session::offer, buf);
+    }
+
+    /** ADMIN_ACTION（term 轮转）立即重试最多 3 次；BACK_PRESSURED 等其他负值不重试，直接返回。 */
+    static long offerRetryingAdminAction(Offerer o, DirectBuffer buf) {
+        long r = o.offer(buf, 0, EVENT_LENGTH);
+        for (int i = 0; i < 3 && r == Publication.ADMIN_ACTION; i++) {
+            r = o.offer(buf, 0, EVENT_LENGTH);
+        }
+        return r;
     }
 
     @Override
@@ -125,6 +150,9 @@ public final class ExchangeService implements ClusteredService {
     public String stateHash() { return engine.stateHash(); }
 
     public long droppedEvents() { return droppedEvents; }
+
+    /** 因 egress 背压而没能送达请求方的确认/回报条数。 */
+    public long egressDropped() { return egressDropped; }
 
     public Cluster.Role role() { return role; }
 

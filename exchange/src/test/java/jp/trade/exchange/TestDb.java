@@ -13,13 +13,13 @@ import jp.trade.exchange.projection.ConnectionFactory;
 import jp.trade.exchange.projection.Schema;
 
 /** 整个测试 JVM 共享一个真实 MariaDB 进程（MySQL 兼容）；每个测试重建表。 */
-final class TestDb {
+public final class TestDb {
     private static DBConfigurationBuilder cfg;
     private static DB db;
 
     private TestDb() {}
 
-    static synchronized ConnectionFactory factory() throws Exception {
+    public static synchronized ConnectionFactory factory() throws Exception {
         if (db == null) {
             cfg = DBConfigurationBuilder.newBuilder();
             cfg.setPort(0);
@@ -38,7 +38,7 @@ final class TestDb {
         return () -> DriverManager.getConnection(url, "root", "");
     }
 
-    static ConnectionFactory freshSchema() throws Exception {
+    public static ConnectionFactory freshSchema() throws Exception {
         final ConnectionFactory f = factory();
         try (Connection c = f.get()) {
             Schema.drop(c);
