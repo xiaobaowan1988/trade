@@ -337,6 +337,11 @@ public final class MatchingEngine {
         return e;
     }
 
+    /** 不还原整个引擎，直接从快照字节读出最后事件序号（布局：nextOrderId, nextEventSeq, ...）。 */
+    public static long lastEventSeqOfSnapshot(byte[] data) {
+        return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getLong(8) - 1;
+    }
+
     public String stateHash() {
         try {
             final byte[] d = MessageDigest.getInstance("SHA-256").digest(snapshot());

@@ -83,17 +83,21 @@ class FailoverBackfillTest {
     private void awaitSameHash() throws Exception {
         final long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
-            String h = null;
-            boolean same = true;
-            for (ExchangeNode n : nodes) {
-                if (n != null) {
-                    final String x = n.service().stateHash();
-                    same &= h == null || h.equals(x);
-                    h = x;
+            try {
+                String h = null;
+                boolean same = true;
+                for (ExchangeNode n : nodes) {
+                    if (n != null) {
+                        final String x = n.service().stateHash();
+                        same &= h == null || h.equals(x);
+                        h = x;
+                    }
                 }
-            }
-            if (same) {
-                return;
+                if (same) {
+                    return;
+                }
+            } catch (RuntimeException racy) {
+                // 撮合线程还在改状态时从测试线程读哈希可能读到半截；稳定后再比较
             }
             Thread.sleep(100);
         }

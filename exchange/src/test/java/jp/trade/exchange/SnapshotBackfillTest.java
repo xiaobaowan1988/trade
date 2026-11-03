@@ -15,7 +15,7 @@ import jp.trade.exchange.events.LoggingEventSink;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 
-/** 补数从快照开始重放；日志裁剪后，快照之后的缺口仍可补，更早的缺口给出明确错误。 */
+/** 补数从快照开始重放（日志裁剪与归档相关的场景见 ArchiveTest）。 */
 class SnapshotBackfillTest {
     private static long seq(byte[] e) { return eventSeq(new UnsafeBuffer(e), 0); }
     private static int type(byte[] e) { return eventType(new UnsafeBuffer(e), 0); }
@@ -86,70 +86,6 @@ class SnapshotBackfillTest {
             Thread.sleep(300);
             assertEquals(node.service().stateHash(), r.rebuildState().stateHash());
             assertTrue(r.lastSeed().startsWith("snapshot@"));
-        }
-    }
-
-    @Test
-    void afterTrimmingLogOnlyPostSnapshotEventsAreRecoverable() throws Exception {
-        final File dir = Files.createTempDirectory("exch-sb2").toFile();
-        // 把归档 segment 缩到 64KB（与日志 term 同长），几千条命令就能跨多个 segment
-        final java.util.function.Consumer<io.aeron.samples.cluster.ClusterConfig> tiny =
-                cfg -> {
-                    cfg.consensusModuleContext().logChannel("aeron:ipc?term-length=64k");
-                    cfg.archiveContext().segmentFileLength(64 * 1024);
-                };
-
-        final LoggingEventSink sink = new LoggingEventSink(false);
-        long s2Seq;
-        long total;
-        try (ExchangeNode node = ExchangeNode.start(0, 1, dir, true, sink, tiny);
-             LogReplayer r = new LogReplayer(node.clusterDir(), node.aeronDirectoryName(), node.archiveControlEndpoint());
-             ExchangeClient c = new ExchangeClient(node.aeronDirectoryName())) {
-            c.deposit(1, ASSET_QUOTE, 1_000_000_000_000L);
-            c.await(1, 10_000);
-            placeOrders(c, 1, 1_200);                       // seq 2..1201
-            awaitEvents(sink, 1_201);
-            snapshotAndWait(node, r, 1);
-            placeOrders(c, 1_201, 1_200);                   // seq 1202..2401
-            awaitEvents(sink, 2_401);
-            snapshotAndWait(node, r, 2);
-            s2Seq = 2_401;                                  // 第二个快照的最后事件序号
-            placeOrders(c, 2_401, 50);                      // seq 2402..2451
-            total = 2_451;
-            awaitEvents(sink, (int) total);
-            Thread.sleep(300);
-            final List<byte[]> truth = sink.events();
-
-            // 裁剪前：任意区间都能补
-            assertSameAsTruth(r.fetch(10, 20), truth, 10, 20);
-
-            final long newStart = r.trimLogToLatestSnapshot();
-            assertTrue(newStart > 0, "日志起点应被推进, start=" + newStart);
-
-            // 快照之后的区间：仍可补，且确实用了快照
-            assertSameAsTruth(r.fetch(s2Seq + 1, total), truth, s2Seq + 1, total);
-            assertTrue(r.lastSeed().contains("lastSeq=" + s2Seq), r.lastSeed());
-
-            // 更早的区间：本地已无法重新生成，错误里给出最早可恢复序号
-            final EventsUnavailableException ex = assertThrows(EventsUnavailableException.class, () -> r.fetch(10, 20));
-            assertTrue(ex.earliestRecoverableSeq > 20, "earliest=" + ex.earliestRecoverableSeq);
-            final long earliest = ex.earliestRecoverableSeq;
-            assertSameAsTruth(r.fetch(earliest, total), truth, earliest, total);
-            assertThrows(EventsUnavailableException.class, () -> r.fetch(earliest - 1, total));
-
-            // 状态一致：裁剪后的日志 + 快照仍能重建与线上完全相同的状态
-            assertEquals(node.service().stateHash(), r.rebuildState().stateHash());
-        }
-
-        // 集群本身也能从“被裁剪的日志 + 快照”重启恢复：撤销一个早期挂单
-        final LoggingEventSink sink2 = new LoggingEventSink(false);
-        try (ExchangeNode node = ExchangeNode.start(0, 1, dir, false, sink2, tiny);
-             ExchangeClient c = new ExchangeClient(node.aeronDirectoryName())) {
-            assertTrue(node.service().loadedFromSnapshot());
-            c.cancel(1, 2); // order 1 是 seq 2 的那张买单
-            final List<byte[]> resp = c.await(1, 15_000);
-            assertEquals(EVT_CANCELLED, type(resp.get(0)));
-            assertEquals(seq(resp.get(0)), total + 1, "事件序号在重启后接着往后走");
         }
     }
 }

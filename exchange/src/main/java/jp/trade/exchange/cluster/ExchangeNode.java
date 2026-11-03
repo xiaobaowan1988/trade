@@ -94,6 +94,8 @@ public final class ExchangeNode implements AutoCloseable {
 
     public String aeronDirectoryName() { return driver.mediaDriver().aeronDirectoryName(); }
 
+    public File archiveDir() { return new File(baseDir, ClusterConfig.ARCHIVE_SUB_DIR); }
+
     public File clusterDir() { return new File(baseDir, ClusterConfig.CLUSTER_SUB_DIR); }
 
     public EventBridge bridge() { return bridge; }

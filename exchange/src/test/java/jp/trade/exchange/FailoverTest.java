@@ -51,13 +51,17 @@ class FailoverTest {
     private void awaitSameHash(int... members) throws Exception {
         final long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
-            final String h = nodes[members[0]].service().stateHash();
-            boolean same = true;
-            for (int m : members) {
-                same &= h.equals(nodes[m].service().stateHash());
-            }
-            if (same) {
-                return;
+            try {
+                final String h = nodes[members[0]].service().stateHash();
+                boolean same = true;
+                for (int m : members) {
+                    same &= h.equals(nodes[m].service().stateHash());
+                }
+                if (same) {
+                    return;
+                }
+            } catch (RuntimeException racy) {
+                // 撮合线程还在改状态时从测试线程读哈希可能读到半截；稳定后再比较
             }
             Thread.sleep(100);
         }
