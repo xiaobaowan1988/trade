@@ -14,6 +14,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import jp.trade.exchange.core.MatchingEngine;
+import jp.trade.exchange.core.SnapshotFraming;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -27,13 +28,15 @@ import static jp.trade.exchange.core.Protocol.encodeEvent;
  * 补数进程核心：读取 Raft 日志录制（Aeron Archive），用与线上完全相同的撮合代码做确定性重放，
  * 重新生成任意序号区间的事件。因为状态机是确定性的，重放出的事件与当初 leader 产生的逐字节一致。
  *
- * 骨架限制：每次都从日志起点重放（O(日志长度)）；日志起点必须为 0（未裁剪）。
- * 生产形态应从快照种子化引擎，并缓存引擎状态或读取 S3 上的日志归档。
+ * 从快照开始重放：选“最后事件序号小于请求起点的最新快照”作种子，重放长度不超过一个快照间隔；
+ * 没有可用快照时才要求日志从头可读，否则抛 {@link EventsUnavailableException}。
+ * 骨架限制：每次补数都重新读取并重放（未缓存引擎状态）；尚未对接 S3 归档。
  */
 public final class LogReplayer implements GapFillingConsumer.Backfill, AutoCloseable {
     private final File clusterDir;
     private final Aeron aeron;
     private final AeronArchive archive;
+    private volatile String lastSeed = "none";
 
     /**
      * @param clusterDir      某个集群成员的 cluster 目录（含 recording.log），或其拷贝
@@ -72,16 +75,40 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
         }
         final long recordingId = plan.log().recordingId();
         final long start = archive.getStartPosition(recordingId);
-        if (start != 0) {
-            throw new UnsupportedOperationException("日志已被裁剪(start=" + start + ")，需要从快照种子化引擎");
-        }
         final long end = committedEnd(plan, recordingId);
-        final MatchingEngine engine = new MatchingEngine();
-        if (end <= start) {
-            return new Result(engine, 0);
-        }
 
-        final long[] last = {0};
+        // ---- 选种子：最后事件序号 < fromSeq 的最新快照；没有则要求日志从头可读 ----
+        MatchingEngine engine = null;
+        long startPos = start;
+        long oldestUsableSnapshotLastSeq = Long.MAX_VALUE;
+        for (SnapshotRef snap : serviceSnapshotsNewestFirst()) {
+            if (snap.logPosition < start || snap.logPosition > end) {
+                continue; // 快照早于被裁剪的日志起点，或晚于已提交位置：不能与日志衔接
+            }
+            final MatchingEngine candidate = readSnapshot(snap.recordingId);
+            oldestUsableSnapshotLastSeq = Math.min(oldestUsableSnapshotLastSeq, candidate.lastEventSeq());
+            if (engine == null && candidate.lastEventSeq() < fromSeq) {
+                engine = candidate;
+                startPos = snap.logPosition;
+                lastSeed = "snapshot@" + snap.logPosition + " lastSeq=" + candidate.lastEventSeq();
+            }
+        }
+        if (engine == null) {
+            if (start != 0) {
+                final long earliest = oldestUsableSnapshotLastSeq == Long.MAX_VALUE
+                        ? Long.MAX_VALUE : oldestUsableSnapshotLastSeq + 1;
+                throw new EventsUnavailableException(fromSeq, earliest);
+            }
+            engine = new MatchingEngine();
+            startPos = 0;
+            lastSeed = "log-start";
+        }
+        if (end <= startPos) {
+            return new Result(engine, engine.lastEventSeq());
+        }
+        final MatchingEngine seeded = engine;
+
+        final long[] last = {engine.lastEventSeq()};
         final boolean[] done = {false};
         final jp.trade.exchange.core.EventHandler filter = (type, aux, seq, ts, orderId, account, price, qty, co, ca) -> {
             last[0] = seq;
@@ -104,12 +131,12 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
             final int payloadOffset = offset + MessageHeaderDecoder.ENCODED_LENGTH + header.blockLength();
             final int payloadLength = length - MessageHeaderDecoder.ENCODED_LENGTH - header.blockLength();
             // 时间戳取日志里记录的集群时间，与线上服务收到的 timestamp 一致
-            engine.onCommand(buf, payloadOffset, payloadLength, session.timestamp(), filter);
+            seeded.onCommand(buf, payloadOffset, payloadLength, session.timestamp(), filter);
         });
 
         final int replayStream = 4001;
         final String replayChannel = "aeron:udp?endpoint=localhost:" + freeUdpPort(); // 重放发布端不接受端口 0
-        final Subscription sub = archive.replay(recordingId, start, end - start, replayChannel, replayStream);
+        final Subscription sub = archive.replay(recordingId, startPos, end - startPos, replayChannel, replayStream);
         try {
             final IdleStrategy idle = new BackoffIdleStrategy(10, 10, 1_000, 1_000_000);
             final long deadline = System.currentTimeMillis() + 60_000;
@@ -133,7 +160,7 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
             archive.stopAllReplays(recordingId);
             CloseHelper.quietClose(sub);
         }
-        return new Result(engine, last[0]);
+        return new Result(seeded, last[0]);
     }
 
     /**
@@ -141,6 +168,90 @@ public final class LogReplayer implements GapFillingConsumer.Backfill, AutoClose
      * term 已结束：用 RecordingLog 中记录的提交位置；term 仍在进行：RecordingLog 里还是 0，
      * 要读本节点 ConsensusModule 的 commit-position 计数器。
      */
+    private record SnapshotRef(long recordingId, long logPosition) {}
+
+    /**
+     * 全部有效的撮合服务快照，新的在前。注意不能用 RecoveryPlan.snapshots()：它只含“最新一份”，
+     * 而补数需要在更早的快照里挑一个序号足够小的做种子。
+     */
+    private List<SnapshotRef> serviceSnapshotsNewestFirst() {
+        final List<SnapshotRef> l = new ArrayList<>();
+        try (RecordingLog log = new RecordingLog(clusterDir, false)) {
+            for (RecordingLog.Entry e : log.entries()) {
+                // serviceId 0 是撮合服务；-1 是 ConsensusModule 自己的快照
+                if (e.isValid && e.type == RecordingLog.ENTRY_TYPE_SNAPSHOT && e.serviceId == 0) {
+                    l.add(new SnapshotRef(e.recordingId, e.logPosition));
+                }
+            }
+        }
+        l.sort((x, y) -> Long.compare(y.logPosition, x.logPosition));
+        return l;
+    }
+
+    /** 从 Archive 读取一份服务快照并还原成引擎。 */
+    private MatchingEngine readSnapshot(long snapshotRecordingId) {
+        final long from = archive.getStartPosition(snapshotRecordingId);
+        final long stop = archive.getStopPosition(snapshotRecordingId);
+        final SnapshotFraming.Reader reader = new SnapshotFraming.Reader();
+        final FragmentHandler h = new io.aeron.FragmentAssembler((buf, offset, length, header) -> reader.accept(buf, offset, length));
+        final Subscription sub = archive.replay(snapshotRecordingId, from, stop - from,
+                "aeron:udp?endpoint=localhost:" + freeUdpPort(), 4002);
+        try {
+            final IdleStrategy idle = new BackoffIdleStrategy(10, 10, 1_000, 1_000_000);
+            final long deadline = System.currentTimeMillis() + 30_000;
+            while (!reader.complete()) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IllegalStateException("snapshot read timeout");
+                }
+                final int n = sub.poll(h, 50);
+                if (n == 0) {
+                    if (sub.imageCount() > 0 && (sub.imageAtIndex(0).isEndOfStream() || sub.imageAtIndex(0).isClosed())) {
+                        break;
+                    }
+                    idle.idle();
+                }
+            }
+        } finally {
+            archive.stopAllReplays(snapshotRecordingId);
+            CloseHelper.quietClose(sub);
+        }
+        return MatchingEngine.fromSnapshot(reader.bytes());
+    }
+
+    /** 最近一次补数用的种子（测试/运维可见）：log-start 或 snapshot@位置。 */
+    public String lastSeed() { return lastSeed; }
+
+    /** 集群里已有的服务快照数量。 */
+    public int snapshotCount() {
+        return serviceSnapshotsNewestFirst().size();
+    }
+
+    /**
+     * 把日志裁剪到最新快照所在的 segment 边界（只删整个 segment）。调用前必须已把这些日志归档到 S3，
+     * 否则早于本地最早可恢复序号的缺口再也补不回来。返回裁剪后的日志起点。
+     */
+    public long trimLogToLatestSnapshot() {
+        final RecordingLog.RecoveryPlan plan;
+        try (RecordingLog log = new RecordingLog(clusterDir, false)) {
+            plan = log.createRecoveryPlan(archive, 1, io.aeron.Aeron.NULL_VALUE);
+        }
+        final List<SnapshotRef> snaps = serviceSnapshotsNewestFirst();
+        if (snaps.isEmpty()) {
+            throw new IllegalStateException("no snapshot to trim to");
+        }
+        final long recordingId = plan.log().recordingId();
+        final int[] segmentLength = {0};
+        archive.listRecording(recordingId, (controlSessionId, correlationId, recId, startTimestamp, stopTimestamp,
+                                             startPosition, stopPosition, initialTermId, segLen, termBufferLength,
+                                             mtuLength, sessionId, streamId, strippedChannel, originalChannel, sourceIdentity)
+                -> segmentLength[0] = segLen);
+        final long target = snaps.get(0).logPosition / segmentLength[0] * segmentLength[0];
+        if (target > archive.getStartPosition(recordingId)) {
+            archive.purgeSegments(recordingId, target);
+        }
+        return archive.getStartPosition(recordingId);
+    }
+
     private static int freeUdpPort() {
         try (java.net.DatagramSocket s = new java.net.DatagramSocket(0)) {
             return s.getLocalPort();

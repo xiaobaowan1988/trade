@@ -10,6 +10,7 @@ import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.FragmentHandler;
 import io.aeron.logbuffer.Header;
 import jp.trade.exchange.core.MatchingEngine;
+import jp.trade.exchange.core.SnapshotFraming;
 import jp.trade.exchange.events.EventBridge;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -25,9 +26,6 @@ import static jp.trade.exchange.core.Protocol.*;
  * - 事件去向 Kafka 由 {@link EventBridge} 的独立线程负责。
  */
 public final class ExchangeService implements ClusteredService {
-    private static final int SNAPSHOT_CHUNK = 1000;
-    private static final int SNAPSHOT_HEADER = 8; // int totalLength | int offset
-
     private Cluster cluster;
     private MatchingEngine engine = new MatchingEngine();
     private Publication eventPublication;
@@ -90,47 +88,31 @@ public final class ExchangeService implements ClusteredService {
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
         final byte[] state = engine.snapshot();
-        final MutableDirectBuffer buf = new ExpandableArrayBuffer(SNAPSHOT_HEADER + SNAPSHOT_CHUNK);
-        for (int off = 0; off < state.length; off += SNAPSHOT_CHUNK) {
-            final int n = Math.min(SNAPSHOT_CHUNK, state.length - off);
-            buf.putInt(0, state.length);
-            buf.putInt(4, off);
-            buf.putBytes(SNAPSHOT_HEADER, state, off, n);
+        final MutableDirectBuffer buf = new ExpandableArrayBuffer(SnapshotFraming.HEADER + SnapshotFraming.CHUNK);
+        for (int off = 0; off < state.length; off += SnapshotFraming.CHUNK) {
+            final int len = SnapshotFraming.encodeChunk(buf, state, off);
             long r;
-            while ((r = snapshotPublication.offer(buf, 0, SNAPSHOT_HEADER + n)) < 0) {
+            while ((r = snapshotPublication.offer(buf, 0, len)) < 0) {
                 if (r == Publication.CLOSED || r == Publication.MAX_POSITION_EXCEEDED) {
                     throw new IllegalStateException("snapshot publication failed: " + r);
                 }
-                cluster.idleStrategy().idle();
+                cluster.idleStrategy().idle(); // 快照允许阻塞，不在撮合热路径上
             }
         }
     }
 
     private void loadSnapshot(Image image) {
-        final byte[][] holder = new byte[1][];
-        final int[] received = {0};
-        final FragmentHandler h = (buffer, offset, length, header) -> {
-            final int total = buffer.getInt(offset);
-            final int off = buffer.getInt(offset + 4);
-            if (holder[0] == null) {
-                holder[0] = new byte[total];
-            }
-            buffer.getBytes(offset + SNAPSHOT_HEADER, holder[0], off, length - SNAPSHOT_HEADER);
-            received[0] += length - SNAPSHOT_HEADER;
-        };
-        while (holder[0] == null || received[0] < holder[0].length) {
-            final int fragments = image.poll(h, 10);
-            if (fragments == 0) {
+        final SnapshotFraming.Reader reader = new SnapshotFraming.Reader();
+        final FragmentHandler h = (buffer, offset, length, header) -> reader.accept(buffer, offset, length);
+        while (!reader.complete()) {
+            if (image.poll(h, 10) == 0) {
                 if (image.isClosed() || image.isEndOfStream()) {
                     break;
                 }
                 cluster.idleStrategy().idle();
             }
         }
-        if (holder[0] == null || received[0] != holder[0].length) {
-            throw new IllegalStateException("incomplete snapshot");
-        }
-        engine = MatchingEngine.fromSnapshot(holder[0]);
+        engine = MatchingEngine.fromSnapshot(reader.bytes());
     }
 
     @Override

@@ -47,6 +47,12 @@ public final class ExchangeNode implements AutoCloseable {
      * @param fresh       true 则清空数据目录从零开始；false 则从已有日志/快照恢复
      */
     public static ExchangeNode start(int memberId, int memberCount, File baseDir, boolean fresh, EventSink sink) {
+        return start(memberId, memberCount, baseDir, fresh, sink, c -> {});
+    }
+
+    /** @param customizer 在启动前调整 Aeron 配置（测试里用来缩小日志/归档分段） */
+    public static ExchangeNode start(int memberId, int memberCount, File baseDir, boolean fresh, EventSink sink,
+                                     java.util.function.Consumer<ClusterConfig> customizer) {
         if (fresh) {
             IoUtil.delete(baseDir, true);
         }
@@ -63,6 +69,7 @@ public final class ExchangeNode implements AutoCloseable {
                 .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(2)); // 默认 10s，缩短以加快故障切换
         config.archiveContext().deleteArchiveOnStart(false).threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED);
 
+        customizer.accept(config);
         final ClusteredMediaDriver driver = ClusteredMediaDriver.launch(
                 config.mediaDriverContext(), config.archiveContext(), config.consensusModuleContext());
         final ClusteredServiceContainer container = ClusteredServiceContainer.launch(config.clusteredServiceContext());
